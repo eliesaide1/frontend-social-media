@@ -282,17 +282,24 @@ export interface PostEngagementDto {
   unavailableMetrics?: string[];
 }
 
+/**
+ * As with PostEngagementDto, Facebook omits the metrics it has retired and
+ * names them in `unavailableMetrics`. Verified 2026-08-24: post_video_views_unique,
+ * post_video_view_time, post_video_avg_time_watched and post_video_views_10s
+ * are unavailable, and completionRate comes back null for non-video posts.
+ */
 export interface PostVideoMetricsDto {
   views: number;
-  viewsUnique: number;
+  viewsUnique?: number;
   viewsPaid: number;
   viewsOrganic: number;
-  views10s: number;
+  views10s?: number;
   viewsSoundOn: number;
   viewTimeMs: number;
   avgTimeWatchedMs: number;
   lengthMs: number;
-  completionRate: number;
+  completionRate: number | null;
+  unavailableMetrics?: string[];
 }
 
 // ─── Comments Management ─────────────────────────────────────

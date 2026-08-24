@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect } from "react";
 import SB_PageHeader from "@/components/ui/SB_PageHeader";
 import SB_Tabs from "@/components/ui/SB_Tabs";
 import SB_MetricCard from "@/components/ui/SB_MetricCard";
@@ -30,12 +30,18 @@ import type {
   StoredMediaDto,
   StoredPostDto,
   PostEngagementDto,
+  PostInsightsDto,
+  PostReactionsDto,
+  PostAttachmentDto,
+  PostVideoMetricsDto,
+  PostCommentDto,
   PageMetricPointDto,
   PageCtaClicksPointDto,
   PageViewsBreakdownPointDto,
   PageInsightsTimeSeriesPoint,
   PageVideoMetricsPointDto,
   PageReactionsDailyPointDto,
+  PageFanChurnPointDto as FanChurnPoint,
 } from "@/types/facebook";
 import type { TimeSeriesResponse } from "@/types/api";
 
@@ -380,6 +386,215 @@ function OverviewTab({ pageId }: { pageId: string }) {
   );
 }
 
+// ─── Daily Tab ────────────────────────────────────
+
+/** Every page-level metric the API reports for a single day. */
+interface DailyRow {
+  date: string;
+  pageViews: number | null;
+  contentViews: number | null;
+  engagedUsers: number | null;
+  postEngagements: number | null;
+  viewsTotal: number | null;
+  videoViews: number | null;
+  videoOrganic: number | null;
+  videoPaid: number | null;
+  videoWatchMin: number | null;
+  video30s: number | null;
+  rxTotal: number | null;
+  rxLike: number | null;
+  rxLove: number | null;
+  rxWow: number | null;
+  rxHaha: number | null;
+  rxSorry: number | null;
+  rxAngry: number | null;
+  fanAdds: number | null;
+  fanRemoves: number | null;
+  fanNet: number | null;
+  ctaClicks: number | null;
+}
+
+const DAILY_DAYS = 90;
+
+function emptyDailyRow(date: string): DailyRow {
+  return {
+    date,
+    pageViews: null, contentViews: null, engagedUsers: null, postEngagements: null,
+    viewsTotal: null, videoViews: null, videoOrganic: null, videoPaid: null,
+    videoWatchMin: null, video30s: null,
+    rxTotal: null, rxLike: null, rxLove: null, rxWow: null, rxHaha: null,
+    rxSorry: null, rxAngry: null,
+    fanAdds: null, fanRemoves: null, fanNet: null, ctaClicks: null,
+  };
+}
+
+function DailyTab({ pageId }: { pageId: string }) {
+  const { data, loading, error, lastUpdated, isLive, setLive } = useLiveData<DailyRow[]>(
+    async () => {
+      const { startDate, endDate } = dateWindow(DAILY_DAYS);
+      const [ins, vid, rx, churn, views, cta] = await Promise.allSettled([
+        fb.getPageInsights(pageId, startDate, endDate) as Promise<TimeSeriesResponse<PageInsightsTimeSeriesPoint>>,
+        fb.getPageVideoMetrics(pageId, startDate, endDate) as Promise<TimeSeriesResponse<PageVideoMetricsPointDto>>,
+        fb.getPageReactionsDaily(pageId, startDate, endDate) as Promise<TimeSeriesResponse<PageReactionsDailyPointDto>>,
+        fb.getPageFanChurn(pageId, startDate, endDate),
+        fb.getPageViewsBreakdown(pageId, startDate, endDate) as Promise<TimeSeriesResponse<PageViewsBreakdownPointDto>>,
+        fb.getPageCtaClicks(pageId, startDate, endDate) as Promise<TimeSeriesResponse<PageCtaClicksPointDto>>,
+      ]);
+
+      const pts = <T,>(r: PromiseSettledResult<TimeSeriesResponse<T>>): T[] =>
+        r.status === "fulfilled" ? r.value?.points ?? [] : [];
+
+      // Every series is keyed on the same day, so fold them into one row each
+      // rather than making the reader cross-reference six separate charts.
+      const rows = new Map<string, DailyRow>();
+      const row = (date: string): DailyRow => {
+        const key = date.slice(0, 10);
+        let r = rows.get(key);
+        if (!r) {
+          r = emptyDailyRow(key);
+          rows.set(key, r);
+        }
+        return r;
+      };
+
+      for (const p of pts(ins)) {
+        const r = row(p.date);
+        const m = p.metrics ?? {};
+        r.pageViews = m.pageViews ?? null;
+        r.contentViews = m.contentViews ?? null;
+        r.engagedUsers = m.engagedUsers ?? null;
+        r.postEngagements = m.postEngagements ?? null;
+      }
+      for (const p of pts(vid)) {
+        const r = row(p.date);
+        const m = p.metrics;
+        r.videoViews = m?.videoViews ?? null;
+        r.videoOrganic = m?.videoViewsOrganic ?? null;
+        r.videoPaid = m?.videoViewsPaid ?? null;
+        r.videoWatchMin = m?.videoViewTimeMs != null ? Math.round(m.videoViewTimeMs / 60000) : null;
+        r.video30s = m?.videoCompleteViews30s ?? null;
+      }
+      for (const p of pts(rx)) {
+        const r = row(p.date);
+        const m = p.metrics;
+        r.rxTotal = m?.reactionsTotal ?? null;
+        r.rxLike = m?.reactionsLike ?? null;
+        r.rxLove = m?.reactionsLove ?? null;
+        r.rxWow = m?.reactionsWow ?? null;
+        r.rxHaha = m?.reactionsHaha ?? null;
+        r.rxSorry = m?.reactionsSorry ?? null;
+        r.rxAngry = m?.reactionsAngry ?? null;
+      }
+      const churnPts: FanChurnPoint[] =
+        churn.status === "fulfilled" ? churn.value?.points ?? [] : [];
+      for (const p of churnPts) {
+        const r = row(p.date);
+        const m = p.metrics;
+        r.fanAdds = m?.fanAdds ?? null;
+        r.fanRemoves = m?.fanRemoves ?? null;
+        r.fanNet = m?.netChange ?? null;
+      }
+      for (const p of pts(views)) row(p.date).viewsTotal = p.metrics?.total ?? null;
+      for (const p of pts(cta)) row(p.date).ctaClicks = p.metrics?.totalActions ?? null;
+
+      // Newest first — the recent days are the ones anyone actually reads.
+      return Array.from(rows.values()).sort((a, b) => b.date.localeCompare(a.date));
+    },
+    [pageId],
+    { interval: POLL_INTERVAL, enabled: false }
+  );
+
+  if (loading) return <div className="text-center py-16 text-muted text-sm">Loading daily breakdown...</div>;
+  if (error) return <div className="text-center py-16 text-red text-sm">{error}</div>;
+
+  const rows = data ?? [];
+  if (rows.length === 0) return <div className="text-center py-16 text-muted text-sm">No daily data</div>;
+
+  const n = (v: number | null) =>
+    v === null ? <span className="text-muted">—</span> : formatNumber(v);
+  const col = (header: string, get: (r: DailyRow) => number | null): Column<DailyRow> => ({
+    header,
+    accessor: (r) => n(get(r)),
+    className: "text-right tabular-nums",
+  });
+
+  const columns: Column<DailyRow>[] = [
+    {
+      header: "Date",
+      accessor: (r) =>
+        new Date(r.date + "T00:00:00").toLocaleDateString("en-US", {
+          month: "short",
+          day: "numeric",
+          year: "2-digit",
+        }),
+      className: "whitespace-nowrap",
+    },
+    col("Views", (r) => r.viewsTotal),
+    col("Page Views", (r) => r.pageViews),
+    col("Content Views", (r) => r.contentViews),
+    col("Engaged", (r) => r.engagedUsers),
+    col("Post Eng.", (r) => r.postEngagements),
+    col("Video", (r) => r.videoViews),
+    col("Organic", (r) => r.videoOrganic),
+    col("Paid", (r) => r.videoPaid),
+    col("Watch min", (r) => r.videoWatchMin),
+    col("30s", (r) => r.video30s),
+    col("Rx Total", (r) => r.rxTotal),
+    col("Like", (r) => r.rxLike),
+    col("Love", (r) => r.rxLove),
+    col("Wow", (r) => r.rxWow),
+    col("Haha", (r) => r.rxHaha),
+    col("Sorry", (r) => r.rxSorry),
+    col("Angry", (r) => r.rxAngry),
+    col("Fans +", (r) => r.fanAdds),
+    col("Fans −", (r) => r.fanRemoves),
+    {
+      header: "Net",
+      accessor: (r) =>
+        r.fanNet === null ? (
+          <span className="text-muted">—</span>
+        ) : (
+          <b className={r.fanNet > 0 ? "text-green" : r.fanNet < 0 ? "text-red" : ""}>
+            {r.fanNet > 0 ? "+" : ""}
+            {r.fanNet}
+          </b>
+        ),
+      className: "text-right tabular-nums",
+    },
+    col("CTA", (r) => r.ctaClicks),
+  ];
+
+  const sum = (get: (r: DailyRow) => number | null) =>
+    rows.reduce((t, r) => t + (get(r) ?? 0), 0);
+
+  return (
+    <>
+      <div className="flex justify-end mb-3">
+        <SB_LiveIndicator isLive={isLive} lastUpdated={lastUpdated} onToggle={setLive} />
+      </div>
+
+      <div className="grid grid-cols-2 md:grid-cols-5 gap-3.5 mb-4">
+        <SB_MetricCard title="Views" value={formatNumber(sum((r) => r.viewsTotal))} />
+        <SB_MetricCard title="Post Engagements" value={formatNumber(sum((r) => r.postEngagements))} />
+        <SB_MetricCard title="Video Views" value={formatNumber(sum((r) => r.videoViews))} />
+        <SB_MetricCard title="Reactions" value={formatNumber(sum((r) => r.rxTotal))} />
+        <SB_MetricCard title="Net Fans" value={formatNumber(sum((r) => r.fanNet))} />
+      </div>
+
+      <SB_Card>
+        <strong className="text-sm">Day by Day ({rows.length} days)</strong>
+        <p className="text-muted text-[12px] mt-1 mb-0">
+          Every page-level metric the API reports, one row per day, newest first.
+          A dash means the API returned no value for that metric that day.
+        </p>
+        <div className="mt-3">
+          <SB_DataTable columns={columns} data={rows} />
+        </div>
+      </SB_Card>
+    </>
+  );
+}
+
 // ─── Content Tab ────────────────────────────────────────────
 
 /** A stored post joined with whatever per-post metrics the API will give us. */
@@ -393,7 +608,203 @@ interface PostRow extends StoredPostDto {
   unavailable: string[];
 }
 
+/** Everything the API will say about one post, fetched only when expanded. */
+interface PostDetail {
+  insights: PostInsightsDto | null;
+  reactions: PostReactionsDto | null;
+  engagement: PostEngagementDto | null;
+  attachments: PostAttachmentDto[];
+  video: PostVideoMetricsDto | null;
+  comments: PostCommentDto[];
+}
+
+function DetailStat({ label, value }: { label: string; value: React.ReactNode }) {
+  return (
+    <div>
+      <div className="text-[11px] text-[#8a96aa] uppercase tracking-[0.04em]">{label}</div>
+      <div className="text-[15px] font-bold mt-0.5">{value}</div>
+    </div>
+  );
+}
+
+/**
+ * Per-post detail. Loaded on expand rather than up front: this is six requests
+ * for a single post, so fetching it for all twenty would be 120 calls against
+ * the page rate limit to fill a panel nobody had opened yet.
+ */
+function PostDetailPanel({ postId }: { postId: string }) {
+  const [detail, setDetail] = useState<PostDetail | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    Promise.allSettled([
+      fb.getPostInsights(postId),
+      fb.getPostReactions(postId),
+      fb.getPostEngagement(postId),
+      fb.getPostAttachments(postId),
+      fb.getPostVideoMetrics(postId),
+      fb.getPostComments(postId),
+    ])
+      .then(([ins, rx, eng, att, vid, com]) => {
+        if (!alive) return;
+        setDetail({
+          insights: ins.status === "fulfilled" ? ins.value : null,
+          reactions: rx.status === "fulfilled" ? rx.value : null,
+          engagement: eng.status === "fulfilled" ? eng.value : null,
+          attachments: att.status === "fulfilled" ? att.value ?? [] : [],
+          video: vid.status === "fulfilled" ? vid.value : null,
+          comments: com.status === "fulfilled" ? com.value ?? [] : [],
+        });
+      })
+      .catch((e) => alive && setErr(e instanceof Error ? e.message : "Failed to load"));
+    return () => {
+      alive = false;
+    };
+  }, [postId]);
+
+  if (err) return <div className="py-4 text-red text-sm">{err}</div>;
+  if (!detail) return <div className="py-4 text-muted text-sm">Loading post details...</div>;
+
+  const { insights, reactions, engagement, attachments, video, comments } = detail;
+  const num = (v: number | null | undefined) => formatNumber(v);
+
+  const unavailable = Array.from(
+    new Set([
+      ...(engagement?.unavailableMetrics ?? []),
+      ...(video?.unavailableMetrics ?? []),
+    ])
+  ).sort();
+
+  const clickTypes = Object.entries(engagement?.clicksByType ?? {});
+
+  return (
+    <div className="bg-[#f9fbfe] border border-line rounded-[12px] p-4 my-2">
+      <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-6 gap-4">
+        <DetailStat label="Impressions" value={num(insights?.impressions)} />
+        <DetailStat label="Reach" value={num(insights?.reach)} />
+        <DetailStat label="Engaged Users" value={num(insights?.engagedUsers)} />
+        <DetailStat label="Clicks" value={num(engagement?.clicks ?? insights?.clicks)} />
+        <DetailStat label="Activity" value={num(engagement?.activity)} />
+        <DetailStat label="Reactions" value={num(reactions?.total)} />
+      </div>
+
+      {reactions && reactions.total > 0 && (
+        <div className="mt-4">
+          <div className="text-[11px] text-[#8a96aa] uppercase tracking-[0.04em] mb-1.5">
+            Reaction breakdown
+          </div>
+          <div className="flex flex-wrap gap-3 text-[13px]">
+            {([
+              ["Like", reactions.like, "#356df3"],
+              ["Love", reactions.love, "#ef4b9a"],
+              ["Wow", reactions.wow, "#ff9f43"],
+              ["Haha", reactions.haha, "#22b573"],
+              ["Sad", reactions.sad, "#8a96aa"],
+              ["Angry", reactions.angry, "#e84a5f"],
+            ] as [string, number, string][])
+              .filter(([, v]) => v > 0)
+              .map(([label, v, color]) => (
+                <span key={label} className="inline-flex items-center gap-1.5">
+                  <span className="w-2.5 h-2.5 rounded-full" style={{ backgroundColor: color }} />
+                  {label}: <b>{v}</b>
+                </span>
+              ))}
+          </div>
+        </div>
+      )}
+
+      {clickTypes.length > 0 && (
+        <div className="mt-4">
+          <div className="text-[11px] text-[#8a96aa] uppercase tracking-[0.04em] mb-1.5">
+            Clicks by type
+          </div>
+          <div className="flex flex-wrap gap-3 text-[13px]">
+            {clickTypes.map(([k, v]) => (
+              <span key={k}>
+                {k}: <b>{v}</b>
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {video && (video.views > 0 || video.lengthMs > 0) && (
+        <div className="mt-4">
+          <div className="text-[11px] text-[#8a96aa] uppercase tracking-[0.04em] mb-1.5">
+            Video
+          </div>
+          <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-6 gap-4">
+            <DetailStat label="Views" value={num(video.views)} />
+            <DetailStat label="Organic" value={num(video.viewsOrganic)} />
+            <DetailStat label="Paid" value={num(video.viewsPaid)} />
+            <DetailStat label="Sound on" value={num(video.viewsSoundOn)} />
+            <DetailStat label="Avg watched" value={`${Math.round((video.avgTimeWatchedMs ?? 0) / 1000)}s`} />
+            <DetailStat
+              label="Completion"
+              value={video.completionRate === null ? "\u2014" : formatPercentage(video.completionRate * 100)}
+            />
+          </div>
+        </div>
+      )}
+
+      {attachments.length > 0 && (
+        <div className="mt-4">
+          <div className="text-[11px] text-[#8a96aa] uppercase tracking-[0.04em] mb-1.5">
+            Attachments ({attachments.length})
+          </div>
+          <div className="grid gap-2">
+            {attachments.map((a, i) => (
+              <div key={i} className="text-[13px]">
+                <SB_Badge variant="facebook">{a.type || "link"}</SB_Badge>{" "}
+                {a.url ? (
+                  <a href={a.url} target="_blank" rel="noopener noreferrer" className="text-brand hover:underline">
+                    {a.title || a.url}
+                  </a>
+                ) : (
+                  <span>{a.title}</span>
+                )}
+                {a.description && (
+                  <div className="text-muted text-[12px] mt-0.5 line-clamp-2">{a.description}</div>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      <div className="mt-4">
+        <div className="text-[11px] text-[#8a96aa] uppercase tracking-[0.04em] mb-1.5">
+          Comments ({comments.length})
+        </div>
+        {comments.length > 0 ? (
+          <SB_MiniList
+            items={comments.slice(0, 10).map((c) => ({
+              label: (
+                <span>
+                  <b>{c.fromName}</b>{" "}
+                  <span className="text-muted">{c.message}</span>
+                </span>
+              ),
+              value: new Date(c.createdTime).toLocaleDateString(),
+            }))}
+          />
+        ) : (
+          <div className="text-muted text-[13px]">No comments on this post.</div>
+        )}
+      </div>
+
+      {unavailable.length > 0 && (
+        <p className="text-muted text-[12px] mt-4 mb-0">
+          Not served by Facebook for this post: {unavailable.join(", ")}.
+        </p>
+      )}
+    </div>
+  );
+}
+
 function ContentTab({ pageId }: { pageId: string }) {
+  const [expanded, setExpanded] = useState<string | null>(null);
   const { data, loading, error, lastUpdated, isLive, setLive } = useLiveData<PostRow[]>(
     async () => {
       const posts = await fb.getStoredPosts(pageId);
@@ -446,6 +857,14 @@ function ContentTab({ pageId }: { pageId: string }) {
     v === null ? <span className="text-muted">—</span> : formatNumber(v);
 
   const columns: Column<PostRow>[] = [
+    {
+      header: "",
+      accessor: (row) => (
+        <span className="text-muted text-xs select-none">
+          {expanded === row.postId ? "\u25be" : "\u25b8"}
+        </span>
+      ),
+    },
     {
       header: "Post",
       accessor: (row) => (
@@ -521,8 +940,15 @@ function ContentTab({ pageId }: { pageId: string }) {
           </p>
         )}
         <div className="mt-3">
-          <SB_DataTable columns={columns} data={posts} />
+          <SB_DataTable
+            columns={columns}
+            data={posts}
+            onRowClick={(row) =>
+              setExpanded((cur) => (cur === row.postId ? null : row.postId))
+            }
+          />
         </div>
+        {expanded && <PostDetailPanel postId={expanded} />}
       </SB_Card>
     </>
   );
@@ -859,6 +1285,7 @@ export default function FacebookPage() {
     if (!pageId) return null;
     switch (activeTab) {
       case "overview":   return <OverviewTab pageId={pageId} />;
+      case "daily":      return <DailyTab pageId={pageId} />;
       case "content":    return <ContentTab pageId={pageId} />;
       case "audience":   return <AudienceTab pageId={pageId} />;
       case "videos":     return <VideosTab pageId={pageId} />;
@@ -912,6 +1339,7 @@ export default function FacebookPage() {
       <SB_Tabs
         tabs={[
           { label: "Overview", value: "overview" },
+          { label: "Day by Day", value: "daily" },
           { label: "Content", value: "content" },
           { label: "Audience", value: "audience" },
           { label: "Videos", value: "videos" },
