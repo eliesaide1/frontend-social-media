@@ -22,18 +22,42 @@ import type {
   PageFollowersDto,
   PageVideoMetricsDto,
   PageReactionsDailyDto,
-  PageNegativeFeedbackDto,
   PageDemographicDto,
   PageLikeSourceDto,
   PageStoryMetricsDto,
   PageFanChurnDto,
-  PageVideoDto,
+  PageFanChurnPointDto,
+  StoredMediaDto,
   StoredPostDto,
+  PostEngagementDto,
   PageMetricPointDto,
+  PageCtaClicksPointDto,
+  PageViewsBreakdownPointDto,
+  PageInsightsTimeSeriesPoint,
+  PageVideoMetricsPointDto,
+  PageReactionsDailyPointDto,
 } from "@/types/facebook";
 import type { TimeSeriesResponse } from "@/types/api";
 
 const POLL_INTERVAL = 15_000; // 15 seconds
+
+/**
+ * Three FacebookAnalytics routes the service layer declares are not deployed:
+ * page-demographics, page-like-sources and page-negative-feedback each return
+ * 404 (checked against the deployed swagger's 58 paths). The page no longer
+ * calls them — every poll spent three round-trips on a guaranteed failure that
+ * Promise.allSettled then swallowed. The panels below say so, rather than
+ * showing a "no data" empty state that reads as "this page has no audience".
+ */
+const ROUTE_NOT_DEPLOYED = "Backend route not deployed (404)";
+
+/** The last `days` days as yyyy-MM-dd, which the dated page metrics require. */
+function dateWindow(days: number) {
+  const iso = (d: Date) => d.toISOString().slice(0, 10);
+  const end = new Date();
+  const start = new Date(end.getTime() - days * 86_400_000);
+  return { startDate: iso(start), endDate: iso(end) };
+}
 
 // ─── Overview Tab ───────────────────────────────────────────
 
@@ -42,28 +66,58 @@ interface OverviewData {
   followers: PageFollowersDto | null;
   videoMetrics: PageVideoMetricsDto | null;
   reactions: PageReactionsDailyDto | null;
-  negative: PageNegativeFeedbackDto | null;
   history: TimeSeriesResponse<PageMetricPointDto> | null;
+  pageViews: TimeSeriesResponse<PageViewsBreakdownPointDto> | null;
+  insightsSeries: TimeSeriesResponse<PageInsightsTimeSeriesPoint> | null;
+  videoSeries: TimeSeriesResponse<PageVideoMetricsPointDto> | null;
+  reactionsSeries: TimeSeriesResponse<PageReactionsDailyPointDto> | null;
+  ctaClicks: TimeSeriesResponse<PageCtaClicksPointDto> | null;
 }
 
 function OverviewTab({ pageId }: { pageId: string }) {
   const { data, loading, error, lastUpdated, isLive, setLive } = useLiveData<OverviewData>(
     async () => {
-      const [insRes, folRes, vidRes, reactRes, negRes, histRes] = await Promise.allSettled([
-        fb.getPageInsights(pageId) as Promise<PageInsightsDto>,
-        fb.getPageFollowers(pageId),
-        fb.getPageVideoMetrics(pageId),
-        fb.getPageReactionsDaily(pageId),
-        fb.getPageNegativeFeedback(pageId),
-        fb.getPageMetricsHistory(pageId),
-      ]);
+      // page-views-breakdown and page-cta-clicks only return a daily series
+      // when given a range; bare, they collapse to a single number.
+      const { startDate, endDate } = dateWindow(90);
+      const [insRes, folRes, vidRes, reactRes, histRes, viewsRes, ctaRes,
+             insSeriesRes, vidSeriesRes, reactSeriesRes] =
+        await Promise.allSettled([
+          fb.getPageInsights(pageId) as Promise<PageInsightsDto>,
+          fb.getPageFollowers(pageId),
+          fb.getPageVideoMetrics(pageId) as Promise<PageVideoMetricsDto>,
+          fb.getPageReactionsDaily(pageId) as Promise<PageReactionsDailyDto>,
+          fb.getPageMetricsHistory(pageId),
+          fb.getPageViewsBreakdown(pageId, startDate, endDate) as Promise<
+            TimeSeriesResponse<PageViewsBreakdownPointDto>
+          >,
+          fb.getPageCtaClicks(pageId, startDate, endDate) as Promise<
+            TimeSeriesResponse<PageCtaClicksPointDto>
+          >,
+          // Same three endpoints as above, asked for by day. Called bare they
+          // collapse to one number, which is why these panels used to show a
+          // single figure instead of a trend.
+          fb.getPageInsights(pageId, startDate, endDate) as Promise<
+            TimeSeriesResponse<PageInsightsTimeSeriesPoint>
+          >,
+          fb.getPageVideoMetrics(pageId, startDate, endDate) as Promise<
+            TimeSeriesResponse<PageVideoMetricsPointDto>
+          >,
+          fb.getPageReactionsDaily(pageId, startDate, endDate) as Promise<
+            TimeSeriesResponse<PageReactionsDailyPointDto>
+          >,
+        ]);
       return {
         insights: insRes.status === "fulfilled" ? insRes.value : null,
         followers: folRes.status === "fulfilled" ? folRes.value : null,
         videoMetrics: vidRes.status === "fulfilled" ? vidRes.value : null,
         reactions: reactRes.status === "fulfilled" ? reactRes.value : null,
-        negative: negRes.status === "fulfilled" ? negRes.value : null,
         history: histRes.status === "fulfilled" ? histRes.value : null,
+        pageViews: viewsRes.status === "fulfilled" ? viewsRes.value : null,
+        ctaClicks: ctaRes.status === "fulfilled" ? ctaRes.value : null,
+        insightsSeries: insSeriesRes.status === "fulfilled" ? insSeriesRes.value : null,
+        videoSeries: vidSeriesRes.status === "fulfilled" ? vidSeriesRes.value : null,
+        reactionsSeries: reactSeriesRes.status === "fulfilled" ? reactSeriesRes.value : null,
       };
     },
     [pageId],
@@ -73,7 +127,8 @@ function OverviewTab({ pageId }: { pageId: string }) {
   if (loading) return <div className="text-center py-16 text-muted text-sm">Loading overview data...</div>;
   if (error) return <div className="text-center py-16 text-red text-sm">{error}</div>;
 
-  const { insights, followers, videoMetrics, reactions, negative, history } = data ?? {};
+  const { insights, followers, videoMetrics, reactions, history, pageViews, ctaClicks,
+          insightsSeries, videoSeries, reactionsSeries } = data ?? {};
 
   const chartData = history?.points?.map((p) => ({
     label: new Date(p.date).toLocaleDateString("en-US", { month: "short", day: "numeric" }),
@@ -81,6 +136,46 @@ function OverviewTab({ pageId }: { pageId: string }) {
     reach: p.reach,
     engagements: p.postEngagements,
   })) ?? [];
+
+  const dayLabel = (iso: string) =>
+    new Date(iso).toLocaleDateString("en-US", { month: "short", day: "numeric" });
+
+  // Daily activity: page views + engagement, one row per day.
+  const activityChart = (insightsSeries?.points ?? []).map((p) => ({
+    label: dayLabel(p.date),
+    pageViews: p.metrics?.pageViews ?? 0,
+    postEngagements: p.metrics?.postEngagements ?? 0,
+  }));
+
+  const videoChart = (videoSeries?.points ?? []).map((p) => ({
+    label: dayLabel(p.date),
+    views: p.metrics?.videoViews ?? 0,
+    organic: p.metrics?.videoViewsOrganic ?? 0,
+    paid: p.metrics?.videoViewsPaid ?? 0,
+  }));
+
+  const reactionsChart = (reactionsSeries?.points ?? []).map((p) => ({
+    label: dayLabel(p.date),
+    total: p.metrics?.reactionsTotal ?? 0,
+    like: p.metrics?.reactionsLike ?? 0,
+    love: p.metrics?.reactionsLove ?? 0,
+  }));
+
+  const viewPoints = pageViews?.points ?? [];
+  const viewsChart = viewPoints.map((p) => ({
+    label: new Date(p.date).toLocaleDateString("en-US", { month: "short", day: "numeric" }),
+    views: p.metrics?.total ?? 0,
+  }));
+  const viewsTotal = viewPoints.reduce((n, p) => n + (p.metrics?.total ?? 0), 0);
+  const viewsPeak = viewPoints.reduce((n, p) => Math.max(n, p.metrics?.total ?? 0), 0);
+  const viewsAvg = viewPoints.length ? viewsTotal / viewPoints.length : 0;
+
+  const ctaPoints = ctaClicks?.points ?? [];
+  const ctaTotal = ctaPoints.reduce((n, p) => n + (p.metrics?.totalActions ?? 0), 0);
+  // Facebook names what it will not serve; show that instead of an empty chart.
+  const ctaUnavailable = Array.from(
+    new Set(ctaPoints.flatMap((p) => p.metrics?.unavailableMetrics ?? []))
+  ).sort();
 
   const reactionColors: Record<string, string> = {
     Like: "#356df3", Love: "#ef4b9a", Wow: "#ff9f43",
@@ -110,10 +205,78 @@ function OverviewTab({ pageId }: { pageId: string }) {
         <SB_MetricCard title="Engaged Users" value={insights ? formatNumber(insights.engagedUsers) : "—"} />
       </div>
 
-      {chartData.length > 0 && (
+      {activityChart.length > 0 && (
         <div className="mt-4">
           <SB_Card>
-            <strong className="text-sm">Page Metrics Over Time</strong>
+            <strong className="text-sm">Daily Activity</strong>
+            <span className="text-muted text-[11px] ml-2">
+              {activityChart.length} days
+            </span>
+            <div className="mt-3">
+              <SB_LineChart
+                data={activityChart}
+                lines={[
+                  { dataKey: "pageViews", color: "#7c5cff", name: "Page Views" },
+                  { dataKey: "postEngagements", color: "#22b573", name: "Post Engagements" },
+                ]}
+                height={260}
+                showLegend
+              />
+            </div>
+          </SB_Card>
+        </div>
+      )}
+
+      {videoChart.length > 0 && (
+        <div className="mt-4">
+          <SB_Card>
+            <strong className="text-sm">Daily Video Views</strong>
+            <span className="text-muted text-[11px] ml-2">
+              {videoChart.length} days
+            </span>
+            <div className="mt-3">
+              <SB_LineChart
+                data={videoChart}
+                lines={[
+                  { dataKey: "views", color: "#356df3", name: "Total" },
+                  { dataKey: "organic", color: "#22b573", name: "Organic" },
+                  { dataKey: "paid", color: "#ff9f43", name: "Paid" },
+                ]}
+                height={240}
+                showLegend
+              />
+            </div>
+          </SB_Card>
+        </div>
+      )}
+
+      {reactionsChart.length > 0 && (
+        <div className="mt-4">
+          <SB_Card>
+            <strong className="text-sm">Daily Reactions</strong>
+            <span className="text-muted text-[11px] ml-2">
+              {reactionsChart.length} days
+            </span>
+            <div className="mt-3">
+              <SB_LineChart
+                data={reactionsChart}
+                lines={[
+                  { dataKey: "total", color: "#ef4b9a", name: "Total" },
+                  { dataKey: "like", color: "#356df3", name: "Like" },
+                  { dataKey: "love", color: "#e84a5f", name: "Love" },
+                ]}
+                height={240}
+                showLegend
+              />
+            </div>
+          </SB_Card>
+        </div>
+      )}
+
+      {chartData.length > 1 && (
+        <div className="mt-4">
+          <SB_Card>
+            <strong className="text-sm">Followers (warehouse history)</strong>
             <div className="mt-3">
               <SB_LineChart
                 data={chartData}
@@ -132,6 +295,43 @@ function OverviewTab({ pageId }: { pageId: string }) {
 
       <div className="grid grid-cols-1 lg:grid-cols-[2fr_1fr] gap-4 mt-4">
         <SB_Card>
+          <strong className="text-sm">Daily Page Views</strong>
+          {viewPoints.length > 0 && (
+            <span className="text-muted text-[11px] ml-2">
+              last {viewPoints.length} days · {formatNumber(viewsTotal)} total ·
+              {" "}{viewsAvg.toFixed(1)}/day avg · peak {formatNumber(viewsPeak)}
+            </span>
+          )}
+          <div className="mt-3">
+            {viewsChart.length > 0 ? (
+              <SB_LineChart
+                data={viewsChart}
+                lines={[{ dataKey: "views", color: "#7c5cff", name: "Page Views" }]}
+                height={240}
+              />
+            ) : (
+              <div className="text-center py-8 text-muted text-sm">No page view data</div>
+            )}
+          </div>
+        </SB_Card>
+
+        <SB_Card>
+          <strong className="text-sm">Call-to-Action Clicks</strong>
+          <div className="text-[28px] font-extrabold mt-2.5">{formatNumber(ctaTotal)}</div>
+          <div className="text-[13px] text-[#68758b]">
+            across {ctaPoints.length} days
+          </div>
+          {ctaUnavailable.length > 0 && (
+            <p className="text-muted text-[12px] mt-3 mb-0">
+              Facebook no longer serves {ctaUnavailable.join(", ")} for this page,
+              so this stays at zero regardless of real CTA activity.
+            </p>
+          )}
+        </SB_Card>
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-[2fr_1fr] gap-4 mt-4">
+        <SB_Card>
           <strong className="text-sm">Video Performance</strong>
           <SB_MiniList
             className="mt-3"
@@ -141,9 +341,8 @@ function OverviewTab({ pageId }: { pageId: string }) {
                     { label: "Total Views", value: <b>{formatNumber(videoMetrics.videoViews)}</b> },
                     { label: "Paid Views", value: <b>{formatNumber(videoMetrics.videoViewsPaid)}</b> },
                     { label: "Organic Views", value: <b>{formatNumber(videoMetrics.videoViewsOrganic)}</b> },
-                    { label: "Unique Views", value: <b>{formatNumber(videoMetrics.videoViewsUnique)}</b> },
                     { label: "30s Complete Views", value: <b>{formatNumber(videoMetrics.videoCompleteViews30s)}</b> },
-                    { label: "Total Watch Time", value: <b>{Math.round(videoMetrics.videoViewTimeMs / 60000)} min</b> },
+                    { label: "Total Watch Time", value: <b>{formatNumber(Math.round((videoMetrics.videoViewTimeMs ?? 0) / 60000))} min</b> },
                   ]
                 : [{ label: "No video data available", value: "—" }]
             }
@@ -177,45 +376,80 @@ function OverviewTab({ pageId }: { pageId: string }) {
         </SB_Card>
       </div>
 
-      {negative && negative.totalNegative > 0 && (
-        <div className="mt-4">
-          <SB_Card>
-            <strong className="text-sm">Negative Feedback</strong>
-            <SB_MiniList
-              className="mt-3"
-              items={[
-                { label: "Hide Clicks", value: <b>{formatNumber(negative.hideClicks)}</b> },
-                { label: "Hide All Clicks", value: <b>{formatNumber(negative.hideAllClicks)}</b> },
-                { label: "Report Spam", value: <b>{formatNumber(negative.reportSpamClicks)}</b> },
-                { label: "Unlike Page", value: <b>{formatNumber(negative.unlikePageClicks)}</b> },
-                { label: "Total", value: <b>{formatNumber(negative.totalNegative)}</b> },
-              ]}
-            />
-          </SB_Card>
-        </div>
-      )}
     </>
   );
 }
 
 // ─── Content Tab ────────────────────────────────────────────
 
+/** A stored post joined with whatever per-post metrics the API will give us. */
+interface PostRow extends StoredPostDto {
+  likes: number | null;
+  comments: number | null;
+  reactions: number | null;
+  reach: number | null;
+  clicks: number | null;
+  clicksByType: Record<string, number> | null;
+  unavailable: string[];
+}
+
 function ContentTab({ pageId }: { pageId: string }) {
-  const { data: posts, loading, error, lastUpdated, isLive, setLive } = useLiveData<StoredPostDto[]>(
-    () => fb.getStoredPosts(pageId),
+  const { data, loading, error, lastUpdated, isLive, setLive } = useLiveData<PostRow[]>(
+    async () => {
+      const posts = await fb.getStoredPosts(pageId);
+
+      // Two sources per post, because neither alone is complete: the warehouse
+      // row carries likes/comments/reactions/reach, while live post-engagement
+      // is the only place real click counts show up (the warehouse stores 0).
+      return Promise.all(
+        posts.map(async (post): Promise<PostRow> => {
+          const [histRes, engRes] = await Promise.allSettled([
+            fb.getPostMetricsHistory(post.postId),
+            fb.getPostEngagement(post.postId),
+          ]);
+
+          const points = histRes.status === "fulfilled" ? histRes.value?.points ?? [] : [];
+          const m = points.length ? points[points.length - 1] : null;
+          const eng: PostEngagementDto | null = engRes.status === "fulfilled" ? engRes.value : null;
+
+          const reactions = m
+            ? m.reactionsLike + m.reactionsLove + m.reactionsWow +
+              m.reactionsHaha + m.reactionsSad + m.reactionsAngry
+            : null;
+
+          return {
+            ...post,
+            likes: m?.likes ?? null,
+            comments: m?.comments ?? null,
+            reactions,
+            reach: m?.reach ?? null,
+            clicks: eng?.clicks ?? m?.clicks ?? null,
+            clicksByType: eng?.clicksByType ?? null,
+            unavailable: eng?.unavailableMetrics ?? [],
+          };
+        })
+      );
+    },
     [pageId],
-    { interval: POLL_INTERVAL }
+    // Polling off by default: this fans out to two requests per post, so a 15s
+    // poll would fire ~40 calls a minute against the page's rate limit.
+    { interval: POLL_INTERVAL, enabled: false }
   );
 
-  if (loading) return <div className="text-center py-16 text-muted text-sm">Loading posts...</div>;
+  if (loading) return <div className="text-center py-16 text-muted text-sm">Loading posts and per-post metrics...</div>;
   if (error) return <div className="text-center py-16 text-red text-sm">{error}</div>;
-  if (!posts || posts.length === 0) return <div className="text-center py-16 text-muted text-sm">No posts found</div>;
 
-  const columns: Column<StoredPostDto>[] = [
+  const posts = data ?? [];
+  if (posts.length === 0) return <div className="text-center py-16 text-muted text-sm">No posts found</div>;
+
+  const num = (v: number | null) =>
+    v === null ? <span className="text-muted">—</span> : formatNumber(v);
+
+  const columns: Column<PostRow>[] = [
     {
       header: "Post",
       accessor: (row) => (
-        <div className="max-w-[300px] truncate text-[13px]">
+        <div className="max-w-[260px] truncate text-[13px]">
           {row.message || <span className="text-muted italic">No text</span>}
         </div>
       ),
@@ -225,7 +459,24 @@ function ContentTab({ pageId }: { pageId: string }) {
       accessor: (row) => <SB_Badge variant="facebook">{row.type || "post"}</SB_Badge>,
     },
     { header: "Date", accessor: (row) => new Date(row.createdTime).toLocaleDateString() },
+    { header: "Likes", accessor: (row) => num(row.likes), className: "text-right" },
+    { header: "Comments", accessor: (row) => num(row.comments), className: "text-right" },
+    { header: "Reactions", accessor: (row) => num(row.reactions), className: "text-right" },
     { header: "Shares", accessor: (row) => formatNumber(row.sharesCount), className: "text-right" },
+    { header: "Reach", accessor: (row) => num(row.reach), className: "text-right" },
+    {
+      header: "Clicks",
+      accessor: (row) => (
+        <span title={
+          row.clicksByType && Object.keys(row.clicksByType).length
+            ? Object.entries(row.clicksByType).map(([k, v]) => `${k}: ${v}`).join(", ")
+            : undefined
+        }>
+          {num(row.clicks)}
+        </span>
+      ),
+      className: "text-right",
+    },
     {
       header: "Link",
       accessor: (row) =>
@@ -237,13 +488,38 @@ function ContentTab({ pageId }: { pageId: string }) {
     },
   ];
 
+  // Surface Facebook's own "we no longer serve this" list rather than letting a
+  // wall of zeros read as "nobody engaged with any of your posts".
+  const unavailable = Array.from(new Set(posts.flatMap((p) => p.unavailable))).sort();
+  const totals = {
+    likes: posts.reduce((n, p) => n + (p.likes ?? 0), 0),
+    comments: posts.reduce((n, p) => n + (p.comments ?? 0), 0),
+    shares: posts.reduce((n, p) => n + p.sharesCount, 0),
+    clicks: posts.reduce((n, p) => n + (p.clicks ?? 0), 0),
+  };
+
   return (
     <>
       <div className="flex justify-end mb-3">
         <SB_LiveIndicator isLive={isLive} lastUpdated={lastUpdated} onToggle={setLive} />
       </div>
+
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3.5 mb-4">
+        <SB_MetricCard title="Likes (all posts)" value={formatNumber(totals.likes)} />
+        <SB_MetricCard title="Comments (all posts)" value={formatNumber(totals.comments)} />
+        <SB_MetricCard title="Shares (all posts)" value={formatNumber(totals.shares)} />
+        <SB_MetricCard title="Clicks (all posts)" value={formatNumber(totals.clicks)} />
+      </div>
+
       <SB_Card>
         <strong className="text-sm">Published Content ({posts.length})</strong>
+        {unavailable.length > 0 && (
+          <p className="text-muted text-[12px] mt-1.5 mb-0">
+            Facebook no longer serves {unavailable.join(", ")} for this page, so
+            those columns stay blank regardless of real engagement. Hover a Clicks
+            value for its breakdown by type.
+          </p>
+        )}
         <div className="mt-3">
           <SB_DataTable columns={columns} data={posts} />
         </div>
@@ -257,21 +533,42 @@ function ContentTab({ pageId }: { pageId: string }) {
 interface AudienceData {
   demographics: PageDemographicDto[];
   fanChurn: PageFanChurnDto | null;
+  fanChurnDays: number;
   likeSources: PageLikeSourceDto[];
 }
 
 function AudienceTab({ pageId }: { pageId: string }) {
   const { data, loading, error, lastUpdated, isLive, setLive } = useLiveData<AudienceData>(
     async () => {
-      const [demRes, churnRes, srcRes] = await Promise.allSettled([
-        fb.getPageDemographics(pageId),
-        fb.getPageFanChurn(pageId),
-        fb.getPageLikeSources(pageId),
+      // Only fan-churn is reachable; see ROUTE_NOT_DEPLOYED above for the
+      // other two. The derived shapes stay so the panels light up unchanged
+      // the day those routes ship.
+      const { startDate, endDate } = dateWindow(90);
+      const [churnRes] = await Promise.allSettled([
+        fb.getPageFanChurn(pageId, startDate, endDate),
       ]);
+
+      // The endpoint answers with one row per day, so total the window rather
+      // than showing a single arbitrary day as if it were the whole picture.
+      const points: PageFanChurnPointDto[] =
+        churnRes.status === "fulfilled" ? churnRes.value?.points ?? [] : [];
+      const fanAdds = points.reduce((n, p) => n + (p.metrics?.fanAdds ?? 0), 0);
+      const fanRemoves = points.reduce((n, p) => n + (p.metrics?.fanRemoves ?? 0), 0);
+
       return {
-        demographics: demRes.status === "fulfilled" ? demRes.value : [],
-        fanChurn: churnRes.status === "fulfilled" ? churnRes.value : null,
-        likeSources: srcRes.status === "fulfilled" ? srcRes.value : [],
+        demographics: [],
+        fanChurn: points.length
+          ? {
+              fanAdds,
+              fanAddsUnique: points.reduce((n, p) => n + (p.metrics?.fanAddsUnique ?? 0), 0),
+              fanRemoves,
+              fanRemovesUnique: points.reduce((n, p) => n + (p.metrics?.fanRemovesUnique ?? 0), 0),
+              netChange: fanAdds - fanRemoves,
+              churnRatio: fanAdds > 0 ? fanRemoves / fanAdds : 0,
+            }
+          : null,
+        fanChurnDays: points.length,
+        likeSources: [],
       };
     },
     [pageId],
@@ -281,7 +578,7 @@ function AudienceTab({ pageId }: { pageId: string }) {
   if (loading) return <div className="text-center py-16 text-muted text-sm">Loading audience data...</div>;
   if (error) return <div className="text-center py-16 text-red text-sm">{error}</div>;
 
-  const { demographics = [], fanChurn = null, likeSources = [] } = data ?? {};
+  const { demographics = [], fanChurn = null, fanChurnDays = 0, likeSources = [] } = data ?? {};
 
   const genderAge = demographics.filter((d) => d.demographicType === "gender_age");
   const countries = demographics.filter((d) => d.demographicType === "country");
@@ -329,12 +626,15 @@ function AudienceTab({ pageId }: { pageId: string }) {
               </div>
             </div>
           ) : (
-            <div className="text-center py-8 text-muted text-sm">No demographic data</div>
+            <div className="text-center py-8 text-muted text-sm">{ROUTE_NOT_DEPLOYED}</div>
           )}
         </SB_Card>
 
         <SB_Card>
           <strong className="text-sm">Fan Growth</strong>
+          {fanChurnDays > 0 && (
+            <span className="text-muted text-[11px] ml-2">last {fanChurnDays} days</span>
+          )}
           {fanChurn ? (
             <SB_MiniList
               className="mt-3"
@@ -373,7 +673,7 @@ function AudienceTab({ pageId }: { pageId: string }) {
                 </div>
               ))
             ) : (
-              <div className="text-center py-6 text-muted text-sm">No country data</div>
+              <div className="text-center py-6 text-muted text-sm">{ROUTE_NOT_DEPLOYED}</div>
             )}
           </div>
         </SB_Card>
@@ -383,24 +683,26 @@ function AudienceTab({ pageId }: { pageId: string }) {
           {topCities.length > 0 ? (
             <SB_MiniList className="mt-3" items={topCities.map((c) => ({ label: c.dimension, value: <b>{formatNumber(c.count)}</b> }))} />
           ) : (
-            <div className="text-center py-6 text-muted text-sm">No city data</div>
+            <div className="text-center py-6 text-muted text-sm">{ROUTE_NOT_DEPLOYED}</div>
           )}
         </SB_Card>
       </div>
 
-      {likeSources.length > 0 && (
-        <div className="mt-4">
-          <SB_Card>
-            <strong className="text-sm">Where Likes Come From</strong>
+      <div className="mt-4">
+        <SB_Card>
+          <strong className="text-sm">Where Likes Come From</strong>
+          {likeSources.length > 0 ? (
             <SB_MiniList
               className="mt-3"
               items={[...likeSources].sort((a, b) => b.fanCount - a.fanCount).slice(0, 10).map((s) => ({
                 label: s.source, value: <b>{formatNumber(s.fanCount)}</b>,
               }))}
             />
-          </SB_Card>
-        </div>
-      )}
+          ) : (
+            <div className="text-center py-6 text-muted text-sm">{ROUTE_NOT_DEPLOYED}</div>
+          )}
+        </SB_Card>
+      </div>
     </>
   );
 }
@@ -408,16 +710,20 @@ function AudienceTab({ pageId }: { pageId: string }) {
 // ─── Videos Tab ─────────────────────────────────────────────
 
 interface VideosData {
-  videos: PageVideoDto[];
+  videos: StoredMediaDto[];
   videoMetrics: PageVideoMetricsDto | null;
 }
 
 function VideosTab({ pageId }: { pageId: string }) {
   const { data, loading, error, lastUpdated, isLive, setLive } = useLiveData<VideosData>(
     async () => {
+      // Warehouse, not the live edge: /FacebookAnalytics/videos takes ~41s to
+      // return the same 648 rows the warehouse serves in under a second, and
+      // POLL_INTERVAL is 15s — so the live call could never finish before the
+      // next one started, leaving the tab stuck on "Loading videos...".
       const [vidRes, metRes] = await Promise.allSettled([
-        fb.getPageVideos(pageId),
-        fb.getPageVideoMetrics(pageId),
+        fb.getStoredVideos(pageId),
+        fb.getPageVideoMetrics(pageId) as Promise<PageVideoMetricsDto>,
       ]);
       return {
         videos: vidRes.status === "fulfilled" ? vidRes.value : [],
@@ -433,7 +739,7 @@ function VideosTab({ pageId }: { pageId: string }) {
 
   const { videos = [], videoMetrics = null } = data ?? {};
 
-  const columns: Column<PageVideoDto>[] = [
+  const columns: Column<StoredMediaDto>[] = [
     {
       header: "Title",
       accessor: (row) => (
@@ -455,13 +761,12 @@ function VideosTab({ pageId }: { pageId: string }) {
         <SB_LiveIndicator isLive={isLive} lastUpdated={lastUpdated} onToggle={setLive} />
       </div>
       {videoMetrics && (
-        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3.5 mb-4">
+        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3.5 mb-4">
           <SB_MetricCard title="Total Views" value={formatNumber(videoMetrics.videoViews)} />
           <SB_MetricCard title="Paid Views" value={formatNumber(videoMetrics.videoViewsPaid)} />
           <SB_MetricCard title="Organic Views" value={formatNumber(videoMetrics.videoViewsOrganic)} />
-          <SB_MetricCard title="Unique Views" value={formatNumber(videoMetrics.videoViewsUnique)} />
           <SB_MetricCard title="30s Completes" value={formatNumber(videoMetrics.videoCompleteViews30s)} />
-          <SB_MetricCard title="Watch Time" value={`${Math.round(videoMetrics.videoViewTimeMs / 60000)}m`} />
+          <SB_MetricCard title="Watch Time" value={`${Math.round((videoMetrics.videoViewTimeMs ?? 0) / 60000)}m`} />
         </div>
       )}
       <SB_Card>

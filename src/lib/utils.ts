@@ -6,9 +6,16 @@ export function cn(...classes: (string | undefined | null | false)[]): string {
 }
 
 /**
- * Format a number with K/M suffix
+ * Format a number with K/M suffix.
+ *
+ * Accepts nullish input on purpose. These values come from API payloads whose
+ * declared DTOs promise fields the service does not always return — an absent
+ * field used to reach `num.toString()` and take the whole page down with
+ * "Cannot read properties of undefined". Rendering the app-wide "—" placeholder
+ * keeps one missing metric from blanking every other metric beside it.
  */
-export function formatNumber(num: number): string {
+export function formatNumber(num: number | null | undefined): string {
+  if (num === null || num === undefined || Number.isNaN(num)) return "—";
   if (num >= 1_000_000) {
     return (num / 1_000_000).toFixed(2).replace(/\.?0+$/, "") + "M";
   }

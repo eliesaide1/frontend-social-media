@@ -114,9 +114,20 @@ export interface PageVideoMetricsDto {
   videoViews: number;
   videoViewsPaid: number;
   videoViewsOrganic: number;
-  videoViewsUnique: number;
+  /** Not returned by the deployed API — verified 2026-08-24. */
+  videoViewsUnique?: number;
   videoViewTimeMs: number;
   videoCompleteViews30s: number;
+}
+
+export interface PageVideoMetricsPointDto {
+  date: string;
+  metrics: PageVideoMetricsDto;
+}
+
+export interface PageReactionsDailyPointDto {
+  date: string;
+  metrics: PageReactionsDailyDto;
 }
 
 export interface PageReactionsDailyDto {
@@ -161,6 +172,17 @@ export interface PageStoryMetricsDto {
 
 // ─── Extended Metrics ────────────────────────────────────────
 
+/**
+ * One day of fan churn. The endpoint returns these wrapped in a
+ * TimeSeriesResponse under `metrics`, not as a flat object — and it requires
+ * startDate/endDate, answering 502 "(#100) The value must be a valid insights
+ * metric" without them.
+ */
+export interface PageFanChurnPointDto {
+  date: string;
+  metrics: PageFanChurnDto;
+}
+
 export interface PageFanChurnDto {
   fanAdds: number;
   fanAddsUnique: number;
@@ -175,9 +197,24 @@ export interface PageCtaClicksDto {
   unavailableMetrics: string[];
 }
 
+/**
+ * Both page-cta-clicks and page-views-breakdown answer with a flat DTO when
+ * called bare, but with a TimeSeriesResponse of these points once startDate and
+ * endDate are supplied — the same dual shape getPageInsights already handles.
+ */
+export interface PageCtaClicksPointDto {
+  date: string;
+  metrics: PageCtaClicksDto;
+}
+
 export interface PageViewsBreakdownDto {
   total: number;
   unavailableMetrics: string[];
+}
+
+export interface PageViewsBreakdownPointDto {
+  date: string;
+  metrics: PageViewsBreakdownDto;
 }
 
 export interface PageAdBreakEarningsDto {
@@ -228,13 +265,21 @@ export interface PostAttachmentDto {
   description: string;
 }
 
+/**
+ * Facebook retired several post-level metrics; the ones it will not serve for
+ * a given post come back named in `unavailableMetrics` and omitted from the
+ * body entirely, so everything but `clicks`, `activity` and `clicksByType` is
+ * optional here. Verified 2026-08-24: post_engaged_users, post_clicks_unique,
+ * post_activity and post_activity_unique are all unavailable for this page.
+ */
 export interface PostEngagementDto {
-  engagedUsers: number;
+  engagedUsers?: number;
   clicks: number;
-  clicksUnique: number;
+  clicksUnique?: number;
   activity: number;
-  activityUnique: number;
+  activityUnique?: number;
   clicksByType: Record<string, number>;
+  unavailableMetrics?: string[];
 }
 
 export interface PostVideoMetricsDto {

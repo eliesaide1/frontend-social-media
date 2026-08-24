@@ -7,6 +7,11 @@ const FB_BASE_URL =
     ? "/api/fb"
     : process.env.NEXT_PUBLIC_FB_API_URL || "http://fbanalyticsapi.tryasp.net";
 
+const IG_BASE_URL =
+  typeof window !== "undefined"
+    ? "/api/ig"
+    : process.env.NEXT_PUBLIC_IG_API_URL || "http://iganalyticsapi.tryasp.net";
+
 /**
  * Centralized API client — similar to ADIR's SharedService.
  *
@@ -104,7 +109,34 @@ class ApiClient {
     });
     return this.handleResponse<T>(response);
   }
+
+  /**
+   * DELETE with a request body — Instagram's product-tags removal takes the
+   * product ids in the body rather than the query string.
+   */
+  async deleteWithBody<T>(
+    endpoint: string,
+    data: Record<string, unknown>
+  ): Promise<T> {
+    const headers = this.getHeaders();
+    const response = await fetch(`${this.baseUrl}${endpoint}`, {
+      method: "DELETE",
+      headers,
+      body: JSON.stringify(data),
+    });
+    return this.handleResponse<T>(response);
+  }
 }
 
 /** Facebook Analytics API client */
 export const fbApiClient = new ApiClient(FB_BASE_URL);
+
+/**
+ * Instagram Analytics API client.
+ *
+ * The Instagram service has no account-scoping header — one system access
+ * token, configured server-side, serves every call — so `setAccountId` is
+ * never used here. The account is selected by the `{igUserId}` path segment
+ * on each route instead.
+ */
+export const igApiClient = new ApiClient(IG_BASE_URL);

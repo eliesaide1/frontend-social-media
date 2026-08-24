@@ -1,3 +1,5 @@
+import type { IgAccount } from "@/types/instagram";
+
 export const APP_NAME = "SocialBoost";
 
 export const NAV_SECTIONS = [
@@ -35,6 +37,52 @@ export const NAV_SECTIONS = [
     title: "Reports",
     items: [{ label: "Reports", icon: "BarChart3", href: "/reports" }],
   },
+] as const;
+
+/**
+ * Instagram accounts the dashboard can show.
+ *
+ * The Instagram Analytics API has no account-list endpoint — every route takes
+ * `{igUserId}` as a path param — so the list is configured here. It mirrors the
+ * `InstagramAccounts.Accounts` section of the service's appsettings.json; an
+ * account absent from that section still answers live calls but is never synced.
+ *
+ * Override at build time with NEXT_PUBLIC_IG_ACCOUNTS, a JSON array of
+ * `{ igUserId, name, adAccountId? }`.
+ */
+export const IG_ACCOUNTS: readonly IgAccount[] = (() => {
+  const raw = process.env.NEXT_PUBLIC_IG_ACCOUNTS;
+  if (raw) {
+    try {
+      const parsed = JSON.parse(raw) as IgAccount[];
+      if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+    } catch {
+      // Malformed override — fall through to the defaults below.
+    }
+  }
+  return [
+    {
+      igUserId: "17841401200423396",
+      name: "businessofhome",
+      adAccountId: "act_1259355961899386",
+    },
+    {
+      igUserId: "17841401992069000",
+      name: "futurism",
+      adAccountId: "act_164967955254577",
+    },
+  ];
+})();
+
+/** Account metrics the Instagram overview requests on the `day` period. */
+export const IG_OVERVIEW_METRICS = [
+  "views",
+  "accounts_engaged",
+  "total_interactions",
+  "likes",
+  "comments",
+  "shares",
+  "saves",
 ] as const;
 
 export const PLATFORM_COLORS = {

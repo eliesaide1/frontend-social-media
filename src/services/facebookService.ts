@@ -17,15 +17,19 @@ import {
   PagePhotoDto,
   // Page Metrics
   PageVideoMetricsDto,
+  PageVideoMetricsPointDto,
   PageReactionsDailyDto,
+  PageReactionsDailyPointDto,
   PageNegativeFeedbackDto,
   PageDemographicDto,
   PageLikeSourceDto,
   PageStoryMetricsDto,
   // Extended Metrics
-  PageFanChurnDto,
+  PageFanChurnPointDto,
   PageCtaClicksDto,
+  PageCtaClicksPointDto,
   PageViewsBreakdownDto,
+  PageViewsBreakdownPointDto,
   PageAdBreakEarningsDto,
   // Post Analytics
   PostInsightsDto,
@@ -192,38 +196,60 @@ export function getPagePhotos(pageId: string) {
 
 // ─── Page Metrics ────────────────────────────────────────────
 
+/** With a date range this returns one point per day; without, a single total. */
 export function getPageVideoMetrics(
   pageId: string,
   startDate?: string,
   endDate?: string
 ) {
+  if (startDate && endDate) {
+    return fbApiClient.get<TimeSeriesResponse<PageVideoMetricsPointDto>>(
+      `/api/FacebookAnalytics/page-video-metrics?pageId=${pageId}${dateParams(startDate, endDate)}`
+    );
+  }
   return fbApiClient.get<PageVideoMetricsDto>(
-    `/api/FacebookAnalytics/page-video-metrics?pageId=${pageId}${dateParams(startDate, endDate)}`
+    `/api/FacebookAnalytics/page-video-metrics?pageId=${pageId}`
   );
 }
 
+/** With a date range this returns one point per day; without, a single total. */
 export function getPageReactionsDaily(
   pageId: string,
   startDate?: string,
   endDate?: string
 ) {
+  if (startDate && endDate) {
+    return fbApiClient.get<TimeSeriesResponse<PageReactionsDailyPointDto>>(
+      `/api/FacebookAnalytics/page-reactions-daily?pageId=${pageId}${dateParams(startDate, endDate)}`
+    );
+  }
   return fbApiClient.get<PageReactionsDailyDto>(
-    `/api/FacebookAnalytics/page-reactions-daily?pageId=${pageId}${dateParams(startDate, endDate)}`
+    `/api/FacebookAnalytics/page-reactions-daily?pageId=${pageId}`
   );
 }
 
+/**
+ * NOT DEPLOYED — returns 404.
+ *
+ * This route and the two below are absent from the deployed API's swagger
+ * (58 paths, checked 2026-08-24). They are kept because they match the
+ * documented service surface and will work unchanged if the backend ships
+ * them, but no page calls them today. Re-check before wiring them into UI.
+ */
 export function getPageNegativeFeedback(pageId: string) {
   return fbApiClient.get<PageNegativeFeedbackDto>(
     `/api/FacebookAnalytics/page-negative-feedback?pageId=${pageId}`
   );
 }
 
+/** NOT DEPLOYED — returns 404. See getPageNegativeFeedback above. */
 export function getPageDemographics(pageId: string) {
   return fbApiClient.get<PageDemographicDto[]>(
     `/api/FacebookAnalytics/page-demographics?pageId=${pageId}`
   );
 }
 
+/** NOT DEPLOYED — returns 404. See getPageNegativeFeedback above. */
 export function getPageLikeSources(pageId: string) {
   return fbApiClient.get<PageLikeSourceDto[]>(
     `/api/FacebookAnalytics/page-like-sources?pageId=${pageId}`
@@ -238,33 +264,46 @@ export function getPageStoryMetrics(pageId: string) {
 
 // ─── Extended Metrics ────────────────────────────────────────
 
+/** Requires startDate/endDate — the API 502s without them. */
 export function getPageFanChurn(
   pageId: string,
   startDate?: string,
   endDate?: string
 ) {
-  return fbApiClient.get<PageFanChurnDto>(
+  return fbApiClient.get<TimeSeriesResponse<PageFanChurnPointDto>>(
     `/api/FacebookAnalytics/page-fan-churn?pageId=${pageId}${dateParams(startDate, endDate)}`
   );
 }
 
+/** With a date range this returns one point per day; without, a single total. */
 export function getPageCtaClicks(
   pageId: string,
   startDate?: string,
   endDate?: string
 ) {
+  if (startDate && endDate) {
+    return fbApiClient.get<TimeSeriesResponse<PageCtaClicksPointDto>>(
+      `/api/FacebookAnalytics/page-cta-clicks?pageId=${pageId}${dateParams(startDate, endDate)}`
+    );
+  }
   return fbApiClient.get<PageCtaClicksDto>(
-    `/api/FacebookAnalytics/page-cta-clicks?pageId=${pageId}${dateParams(startDate, endDate)}`
+    `/api/FacebookAnalytics/page-cta-clicks?pageId=${pageId}`
   );
 }
 
+/** With a date range this returns one point per day; without, a single total. */
 export function getPageViewsBreakdown(
   pageId: string,
   startDate?: string,
   endDate?: string
 ) {
+  if (startDate && endDate) {
+    return fbApiClient.get<TimeSeriesResponse<PageViewsBreakdownPointDto>>(
+      `/api/FacebookAnalytics/page-views-breakdown?pageId=${pageId}${dateParams(startDate, endDate)}`
+    );
+  }
   return fbApiClient.get<PageViewsBreakdownDto>(
-    `/api/FacebookAnalytics/page-views-breakdown?pageId=${pageId}${dateParams(startDate, endDate)}`
+    `/api/FacebookAnalytics/page-views-breakdown?pageId=${pageId}`
   );
 }
 
