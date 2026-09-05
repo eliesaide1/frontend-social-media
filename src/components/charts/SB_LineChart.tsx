@@ -23,6 +23,15 @@ interface SB_LineChartProps {
   height?: number;
   showGrid?: boolean;
   showLegend?: boolean;
+  /**
+   * Explicit y-axis bounds. Recharts defaults to starting at 0, which flattens
+   * any series whose movement is small relative to its magnitude — a follower
+   * count wandering between 23,939 and 23,943 draws as a straight line on a
+   * 0–24,000 axis. Pass a fitted domain to show the shape instead.
+   */
+  yDomain?: [number, number];
+  /** Formats the y-axis ticks, e.g. compact follower counts. */
+  yTickFormatter?: (value: number) => string;
 }
 
 export default function SB_LineChart({
@@ -31,6 +40,8 @@ export default function SB_LineChart({
   height = 280,
   showGrid = true,
   showLegend = false,
+  yDomain,
+  yTickFormatter,
 }: SB_LineChartProps) {
   return (
     <ResponsiveContainer width="100%" height={height}>
@@ -48,7 +59,13 @@ export default function SB_LineChart({
           tick={{ fontSize: 12, fill: "#8a96aa" }}
           tickLine={false}
           axisLine={false}
-          width={45}
+          width={yDomain ? 60 : 45}
+          domain={yDomain}
+          // A fitted domain must not be widened back out to round numbers,
+          // or the zoom it exists to provide is undone.
+          allowDataOverflow={false}
+          allowDecimals={false}
+          tickFormatter={yTickFormatter}
         />
         <Tooltip
           contentStyle={{

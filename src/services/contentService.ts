@@ -6,12 +6,14 @@
 import * as fb from "./facebookService";
 import type { StoredPostDto, ScheduledPostDto } from "@/types/facebook";
 
+/** Warehouse read — no Graph call, so it costs no Meta rate limit. */
 export async function getAllContent(
   pageId: string,
   from?: string,
-  to?: string
+  to?: string,
+  includeDeleted = false
 ): Promise<StoredPostDto[]> {
-  return fb.getStoredPosts(pageId, from, to);
+  return fb.getStoredPosts(pageId, from, to, includeDeleted);
 }
 
 export async function getScheduledContent(

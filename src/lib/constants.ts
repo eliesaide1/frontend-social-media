@@ -50,9 +50,34 @@ export const CHART_COLORS = {
   purple: "#7c5cff",
 } as const;
 
+/**
+ * Dashboard date ranges, in days back from today.
+ *
+ * Capped at 90 because Meta rejects any insights window longer than 93 days
+ * ("Time range too long"), and the metric endpoints validate that up front.
+ */
 export const DATE_RANGES = [
-  { label: "Aug 1 – Aug 31, 2026", value: "aug-2026" },
-  { label: "Last 7 Days", value: "7d" },
-  { label: "Last 30 Days", value: "30d" },
-  { label: "Last 90 Days", value: "90d" },
+  { label: "Last 7 Days", value: "7d", days: 7 },
+  { label: "Last 30 Days", value: "30d", days: 30 },
+  { label: "Last 90 Days", value: "90d", days: 90 },
 ] as const;
+
+export const DEFAULT_DATE_RANGE = "30d";
+
+/** The key that puts the topbar into from/to mode. */
+export const CUSTOM_DATE_RANGE = "custom";
+
+/**
+ * Meta rejects any insights window longer than this ("Time range too long").
+ * The service guard uses it as the absolute limit.
+ */
+export const MAX_RANGE_DAYS = 93;
+
+/**
+ * What a custom range may span in the picker.
+ *
+ * Deliberately under Meta's 93 so the longest selectable window matches the
+ * "Last 90 Days" preset and leaves headroom rather than sitting on the edge of
+ * a limit that returns an error instead of a truncated series.
+ */
+export const MAX_SELECTABLE_DAYS = 90;

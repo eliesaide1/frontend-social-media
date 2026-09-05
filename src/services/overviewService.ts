@@ -25,11 +25,20 @@ export async function getOverviewData(
   startDate?: string,
   endDate?: string
 ) {
-  const [followers, insights, pageMetrics] = await Promise.all([
+  // allSettled, not all: insights depends on metrics Meta has deprecated and
+  // can 502 on its own, which should not blank the follower count beside it.
+  const [followersRes, insightsRes, historyRes] = await Promise.allSettled([
     fb.getPageFollowers(pageId),
-    fb.getPageInsights(pageId),
-    fb.getPageMetricsHistory(pageId),
+    // Both dates or neither — a half-range silently changes the response shape.
+    startDate && endDate
+      ? fb.getPageInsights(pageId, startDate, endDate)
+      : fb.getPageInsights(pageId),
+    fb.getPageMetricsHistory(pageId, startDate, endDate),
   ]);
 
-  return { followers, insights, pageMetrics };
+  return {
+    followers: followersRes.status === "fulfilled" ? followersRes.value : null,
+    insights: insightsRes.status === "fulfilled" ? insightsRes.value : null,
+    pageMetrics: historyRes.status === "fulfilled" ? historyRes.value : null,
+  };
 }

@@ -7,13 +7,24 @@ import SB_Modal from "@/components/ui/SB_Modal";
 import SB_CreatePostForm from "@/components/forms/SB_CreatePostForm";
 import SB_Toast from "@/components/ui/SB_Toast";
 import { useToast } from "@/hooks/useToast";
+import { DateRangeProvider } from "@/contexts/DateRangeContext";
 
 export default function SB_DashboardShell({
   children,
 }: {
   children: React.ReactNode;
 }) {
-  const [selectedDateRange, setSelectedDateRange] = useState("aug-2026");
+  // The provider wraps the shell so the topbar selector and every page below
+  // read the same range — previously the selection lived in local state here
+  // and reached nothing.
+  return (
+    <DateRangeProvider>
+      <DashboardChrome>{children}</DashboardChrome>
+    </DateRangeProvider>
+  );
+}
+
+function DashboardChrome({ children }: { children: React.ReactNode }) {
   const [createPostOpen, setCreatePostOpen] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const { toast, showToast, hideToast } = useToast();
@@ -27,8 +38,6 @@ export default function SB_DashboardShell({
       />
       <main className="flex-1 min-w-0">
         <SB_Topbar
-          selectedDateRange={selectedDateRange}
-          onDateRangeChange={setSelectedDateRange}
           onExport={() => showToast("Report exported")}
           onMenuToggle={() => setSidebarOpen(true)}
         />

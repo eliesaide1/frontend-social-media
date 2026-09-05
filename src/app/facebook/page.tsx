@@ -9,93 +9,163 @@ import SB_MiniList from "@/components/ui/SB_MiniList";
 import SB_DataTable, { Column } from "@/components/ui/SB_DataTable";
 import SB_LineChart from "@/components/charts/SB_LineChart";
 import SB_DonutChart from "@/components/charts/SB_DonutChart";
-import SB_ProgressBar from "@/components/ui/SB_ProgressBar";
 import SB_Badge from "@/components/ui/SB_Badge";
 import SB_Select from "@/components/ui/SB_Select";
 import SB_LiveIndicator from "@/components/ui/SB_LiveIndicator";
-import { formatNumber, formatPercentage } from "@/lib/utils";
+import SB_Modal from "@/components/ui/SB_Modal";
+import SB_PostDetail from "@/components/facebook/SB_PostDetail";
+import SB_Pagination from "@/components/ui/SB_Pagination";
+import { usePagination } from "@/hooks/usePagination";
+import {
+  bucketSeries,
+  fitAxisDomain,
+  formatNumber,
+  postTypeLabel,
+} from "@/lib/utils";
 import { useFbAccount } from "@/hooks/useFbAccount";
 import { useLiveData } from "@/hooks/useLiveData";
+import { useDateRange } from "@/contexts/DateRangeContext";
 import * as fb from "@/services/facebookService";
 import type {
-  PageInsightsDto,
+  PageInsightsSeries,
+  PageVideoMetricsSeries,
+  PageReactionsDailySeries,
   PageFollowersDto,
   PageVideoMetricsDto,
-  PageReactionsDailyDto,
-  PageNegativeFeedbackDto,
-  PageDemographicDto,
-  PageLikeSourceDto,
-  PageStoryMetricsDto,
-  PageFanChurnDto,
+  PageFanChurnSeries,
+  PageCtaClicksSeries,
   PageVideoDto,
   StoredPostDto,
   PageMetricPointDto,
 } from "@/types/facebook";
-import type { TimeSeriesResponse } from "@/types/api";
+import type { MetricSeries, TimeSeriesResponse } from "@/types/api";
 
 const POLL_INTERVAL = 15_000; // 15 seconds
+
 
 // ─── Overview Tab ───────────────────────────────────────────
 
 interface OverviewData {
-  insights: PageInsightsDto | null;
+  insights: PageInsightsSeries | null;
   followers: PageFollowersDto | null;
-  videoMetrics: PageVideoMetricsDto | null;
-  reactions: PageReactionsDailyDto | null;
-  negative: PageNegativeFeedbackDto | null;
+  videoMetrics: PageVideoMetricsSeries | null;
+  reactions: PageReactionsDailySeries | null;
   history: TimeSeriesResponse<PageMetricPointDto> | null;
 }
 
 function OverviewTab({ pageId }: { pageId: string }) {
+  const { startDate, endDate, grouping } = useDateRange();
+
   const { data, loading, error, lastUpdated, isLive, setLive } = useLiveData<OverviewData>(
     async () => {
-      const [insRes, folRes, vidRes, reactRes, negRes, histRes] = await Promise.allSettled([
-        fb.getPageInsights(pageId) as Promise<PageInsightsDto>,
-        fb.getPageFollowers(pageId),
-        fb.getPageVideoMetrics(pageId),
-        fb.getPageReactionsDaily(pageId),
-        fb.getPageNegativeFeedback(pageId),
-        fb.getPageMetricsHistory(pageId),
-      ]);
+      // Every metric here is fetched RANGED, so the topbar selector actually
+      // changes the numbers. Un-ranged, Meta returns only its default two-day
+      // window and these read as permanently near-zero.
+      //
+      // allSettled, not all: several depend on metrics Meta has deprecated or
+      // permissions the token may lack, and one 502 should not blank the tab.
+      const [insRes, folRes, vidRes, reactRes, histRes] =
+        await Promise.allSettled([
+          fb.getPageInsights(pageId, startDate, endDate),
+          fb.getPageFollowers(pageId),
+          fb.getPageVideoMetrics(pageId, startDate, endDate),
+          fb.getPageReactionsDaily(pageId, startDate, endDate),
+          fb.getPageMetricsHistory(pageId, startDate, endDate),
+        ]);
       return {
         insights: insRes.status === "fulfilled" ? insRes.value : null,
         followers: folRes.status === "fulfilled" ? folRes.value : null,
         videoMetrics: vidRes.status === "fulfilled" ? vidRes.value : null,
         reactions: reactRes.status === "fulfilled" ? reactRes.value : null,
-        negative: negRes.status === "fulfilled" ? negRes.value : null,
         history: histRes.status === "fulfilled" ? histRes.value : null,
       };
     },
-    [pageId],
-    { interval: POLL_INTERVAL }
+    [pageId, startDate, endDate],
+    // Ranged reads are live Graph calls, not the cached flat endpoints, so
+    // this polls far less aggressively than a snapshot would.
+    { interval: 300_000, enabled: false }
   );
 
   if (loading) return <div className="text-center py-16 text-muted text-sm">Loading overview data...</div>;
   if (error) return <div className="text-center py-16 text-red text-sm">{error}</div>;
 
-  const { insights, followers, videoMetrics, reactions, negative, history } = data ?? {};
+  const { insights, followers, videoMetrics, reactions, history } = data ?? {};
 
-  const chartData = history?.points?.map((p) => ({
-    label: new Date(p.date).toLocaleDateString("en-US", { month: "short", day: "numeric" }),
-    followers: p.followersCount,
-    reach: p.reach,
-    engagements: p.postEngagements,
-  })) ?? [];
+  // Ranged responses are per-day series. These metrics are additive counts, so
+  // the figure for the window is their sum — not the last day's value, which is
+  // what an un-ranged read would have given.
+  function sumMetric<T>(
+    series: MetricSeries<T> | null | undefined,
+    pick: (m: T) => number | undefined
+  ): number {
+    return (series?.points ?? []).reduce(
+      (total, p) => total + (pick(p.metrics) ?? 0),
+      0
+    );
+  }
+
+  const pageViews = sumMetric(insights, (m) => m.pageViews);
+  const postEngagements = sumMetric(insights, (m) => m.postEngagements);
+  const videoViews = sumMetric(videoMetrics, (m) => m.videoViews);
+
+  // Sourced from the RANGED insights series, not warehouse history.
+  //
+  // page-metrics-history is written by the nightly job, so it holds one row per
+  // day the job has run — two rows for this page, which no date range can widen.
+  // The insights series returns a point per day in the requested window, so this
+  // is the chart that can actually follow the topbar selector.
+  //
+  // `reach` is excluded on purpose: it maps to page_impressions_unique, which
+  // Meta deprecated, so it is always 0 and only adds a flat line.
+  const chartData = bucketSeries(
+    (insights?.points ?? []).map((p) => ({
+      date: p.date,
+      pageViews: p.metrics.pageViews ?? 0,
+      engagements: p.metrics.postEngagements ?? 0,
+    })),
+    grouping,
+    { pageViews: "sum", engagements: "sum" }
+  );
+
+  // Followers live on their own chart: a count in the tens of thousands plotted
+  // beside daily activity in the tens flattens both onto one axis.
+  const followerTrend = bucketSeries(
+    (history?.points ?? []).map((p) => ({
+      date: p.date,
+      followers: p.followersCount,
+    })),
+    grouping,
+    { followers: "last" }
+  );
+  const followerDomain = fitAxisDomain(
+    followerTrend.map((p) => Number(p.followers))
+  );
+
+  // Meta returns fan_count and followers_count as the same number for this
+  // Page, so showing both would print one measurement twice under two labels.
+  // The day-over-day follower delta is real movement, so it rides along on the
+  // Followers tile instead of occupying a tile of its own.
+  const latest = history?.points?.[history.points.length - 1];
+  const followerDelta = latest?.followersDelta ?? null;
 
   const reactionColors: Record<string, string> = {
     Like: "#356df3", Love: "#ef4b9a", Wow: "#ff9f43",
     Haha: "#22b573", Sorry: "#8a96aa", Angry: "#e84a5f",
   };
-  const reactionsDonut = reactions
-    ? [
-        { name: "Like", value: reactions.reactionsLike, color: reactionColors.Like },
-        { name: "Love", value: reactions.reactionsLove, color: reactionColors.Love },
-        { name: "Wow", value: reactions.reactionsWow, color: reactionColors.Wow },
-        { name: "Haha", value: reactions.reactionsHaha, color: reactionColors.Haha },
-        { name: "Sorry", value: reactions.reactionsSorry, color: reactionColors.Sorry },
-        { name: "Angry", value: reactions.reactionsAngry, color: reactionColors.Angry },
-      ].filter((r) => r.value > 0)
-    : [];
+  const reactionsDonut = [
+    { name: "Like", value: sumMetric(reactions, (m) => m.reactionsLike), color: reactionColors.Like },
+    { name: "Love", value: sumMetric(reactions, (m) => m.reactionsLove), color: reactionColors.Love },
+    { name: "Wow", value: sumMetric(reactions, (m) => m.reactionsWow), color: reactionColors.Wow },
+    { name: "Haha", value: sumMetric(reactions, (m) => m.reactionsHaha), color: reactionColors.Haha },
+    { name: "Sorry", value: sumMetric(reactions, (m) => m.reactionsSorry), color: reactionColors.Sorry },
+    { name: "Angry", value: sumMetric(reactions, (m) => m.reactionsAngry), color: reactionColors.Angry },
+  ].filter((r) => r.value > 0);
+
+  // Summed from the buckets rather than read from reactionsTotal. Meta returns
+  // page_actions_post_reactions_total as an OBJECT keyed by reaction type, so
+  // the API's scalar reader yields 0 — which showed a donut labelled "0 Total"
+  // wrapped around segments adding to 97. The buckets are the reliable source.
+  const reactionsTotal = reactionsDonut.reduce((sum, r) => sum + r.value, 0);
 
   return (
     <>
@@ -104,22 +174,35 @@ function OverviewTab({ pageId }: { pageId: string }) {
       </div>
 
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3.5">
-        <SB_MetricCard title="Followers" value={followers ? formatNumber(followers.followersCount) : "—"} />
-        <SB_MetricCard title="Page Views" value={insights ? formatNumber(insights.pageViews) : "—"} />
-        <SB_MetricCard title="Engagements" value={insights ? formatNumber(insights.postEngagements) : "—"} />
-        <SB_MetricCard title="Engaged Users" value={insights ? formatNumber(insights.engagedUsers) : "—"} />
+        <SB_MetricCard
+          title="Followers"
+          value={followers ? formatNumber(followers.followersCount) : "—"}
+          change={
+            followerDelta === null
+              ? undefined
+              : `${formatNumber(Math.abs(followerDelta))} since previous day`
+          }
+          changeDirection={(followerDelta ?? 0) >= 0 ? "up" : "down"}
+        />
+        <SB_MetricCard title="Page Views" value={insights ? formatNumber(pageViews) : "—"} />
+        <SB_MetricCard title="Engagements" value={insights ? formatNumber(postEngagements) : "—"} />
+        <SB_MetricCard
+          title="Reactions"
+          value={reactions ? formatNumber(reactionsTotal) : "—"}
+        />
       </div>
 
       {chartData.length > 0 && (
         <div className="mt-4">
           <SB_Card>
-            <strong className="text-sm">Page Metrics Over Time</strong>
+            <strong className="text-sm">
+              Page Activity Over Time ({grouping === "day" ? "daily" : "monthly"})
+            </strong>
             <div className="mt-3">
               <SB_LineChart
                 data={chartData}
                 lines={[
-                  { dataKey: "followers", color: "#356df3", name: "Followers" },
-                  { dataKey: "reach", color: "#ef4b9a", name: "Reach" },
+                  { dataKey: "pageViews", color: "#356df3", name: "Page Views" },
                   { dataKey: "engagements", color: "#22b573", name: "Engagements" },
                 ]}
                 height={280}
@@ -130,6 +213,31 @@ function OverviewTab({ pageId }: { pageId: string }) {
         </div>
       )}
 
+      <div className="mt-4">
+        <SB_Card>
+          <strong className="text-sm">Follower Trend</strong>
+          {followerTrend.length > 1 ? (
+            <div className="mt-3">
+              <SB_LineChart
+                data={followerTrend}
+                lines={[{ dataKey: "followers", color: "#356df3", name: "Followers" }]}
+                height={240}
+                yDomain={followerDomain}
+                yTickFormatter={(v) => v.toLocaleString()}
+              />
+            </div>
+          ) : (
+            <p className="text-xs text-muted mt-2 leading-relaxed">
+              Follower history comes from the warehouse, which stores one row per
+              day the nightly ingestion job has run — currently{" "}
+              {followerTrend.length === 1 ? "one day" : "no days"} in this window.
+              Unlike the chart above it cannot be widened by changing the date
+              range; it fills in as the job runs.
+            </p>
+          )}
+        </SB_Card>
+      </div>
+
       <div className="grid grid-cols-1 lg:grid-cols-[2fr_1fr] gap-4 mt-4">
         <SB_Card>
           <strong className="text-sm">Video Performance</strong>
@@ -138,12 +246,11 @@ function OverviewTab({ pageId }: { pageId: string }) {
             items={
               videoMetrics
                 ? [
-                    { label: "Total Views", value: <b>{formatNumber(videoMetrics.videoViews)}</b> },
-                    { label: "Paid Views", value: <b>{formatNumber(videoMetrics.videoViewsPaid)}</b> },
-                    { label: "Organic Views", value: <b>{formatNumber(videoMetrics.videoViewsOrganic)}</b> },
-                    { label: "Unique Views", value: <b>{formatNumber(videoMetrics.videoViewsUnique)}</b> },
-                    { label: "30s Complete Views", value: <b>{formatNumber(videoMetrics.videoCompleteViews30s)}</b> },
-                    { label: "Total Watch Time", value: <b>{Math.round(videoMetrics.videoViewTimeMs / 60000)} min</b> },
+                    { label: "Total Views", value: <b>{formatNumber(videoViews)}</b> },
+                    { label: "Paid Views", value: <b>{formatNumber(sumMetric(videoMetrics, (m) => m.videoViewsPaid))}</b> },
+                    { label: "Organic Views", value: <b>{formatNumber(sumMetric(videoMetrics, (m) => m.videoViewsOrganic))}</b> },
+                    { label: "30s Complete Views", value: <b>{formatNumber(sumMetric(videoMetrics, (m) => m.videoCompleteViews30s))}</b> },
+                    { label: "Total Watch Time", value: <b>{Math.round(sumMetric(videoMetrics, (m) => m.videoViewTimeMs) / 60000)} min</b> },
                   ]
                 : [{ label: "No video data available", value: "—" }]
             }
@@ -157,7 +264,7 @@ function OverviewTab({ pageId }: { pageId: string }) {
               <div className="mt-3">
                 <SB_DonutChart
                   data={reactionsDonut}
-                  centerValue={formatNumber(reactions!.reactionsTotal)}
+                  centerValue={formatNumber(reactionsTotal)}
                   centerLabel="Total"
                   size={160}
                 />
@@ -177,63 +284,336 @@ function OverviewTab({ pageId }: { pageId: string }) {
         </SB_Card>
       </div>
 
-      {negative && negative.totalNegative > 0 && (
-        <div className="mt-4">
-          <SB_Card>
-            <strong className="text-sm">Negative Feedback</strong>
-            <SB_MiniList
-              className="mt-3"
-              items={[
-                { label: "Hide Clicks", value: <b>{formatNumber(negative.hideClicks)}</b> },
-                { label: "Hide All Clicks", value: <b>{formatNumber(negative.hideAllClicks)}</b> },
-                { label: "Report Spam", value: <b>{formatNumber(negative.reportSpamClicks)}</b> },
-                { label: "Unlike Page", value: <b>{formatNumber(negative.unlikePageClicks)}</b> },
-                { label: "Total", value: <b>{formatNumber(negative.totalNegative)}</b> },
-              ]}
-            />
-          </SB_Card>
-        </div>
-      )}
     </>
   );
 }
 
-// ─── Content Tab ────────────────────────────────────────────
+// ─── Audience Tab ───────────────────────────────────────────
+//
+// Everything here is a RANGED read, deliberately.
+//
+// page-fan-churn without a date range calls Meta with page_fan_adds /
+// page_fan_removes, which Meta deleted — it answers 502 every time. The ranged
+// path asks for page_daily_follows / page_daily_unfollows_unique instead and
+// returns real numbers, so the range is what makes this tab work at all.
+// page-cta-clicks is a daily metric too: without a range Meta returns only its
+// default two-day window.
+//
+// page-demographics, page-like-sources and page-negative-feedback have no
+// route at all — every Meta metric behind them (page_fans_gender_age, _city,
+// _country, page_fans_by_like_source, page_negative_feedback) was removed at
+// v25.0, so gender, age, country and city breakdowns are unobtainable.
 
-function ContentTab({ pageId }: { pageId: string }) {
+const GROUPING_OPTIONS = [
+  { label: "By day", value: "day" },
+  { label: "By month", value: "month" },
+];
+
+interface AudienceData {
+  churn: PageFanChurnSeries | null;
+  churnError: string | null;
+  cta: PageCtaClicksSeries | null;
+  history: TimeSeriesResponse<PageMetricPointDto> | null;
+}
+
+function AudienceTab({ pageId }: { pageId: string }) {
+  const { startDate, endDate, days, label, grouping, setGrouping } =
+    useDateRange();
+
+  // These are live Graph reads, not the cached flat endpoints, and a 90-day
+  // insights call is expensive. So no polling by default — the range is the
+  // point of this tab, not second-by-second freshness.
+  const { data, loading, error, lastUpdated, isLive, setLive, refresh } =
+    useLiveData<AudienceData>(
+      async () => {
+        const [churnRes, ctaRes, histRes] = await Promise.allSettled([
+          fb.getPageFanChurn(pageId, startDate, endDate),
+          fb.getPageCtaClicks(pageId, startDate, endDate),
+          fb.getPageMetricsHistory(pageId, startDate, endDate),
+        ]);
+
+        return {
+          churn: churnRes.status === "fulfilled" ? churnRes.value : null,
+          // Surfaced rather than swallowed: an empty card with no explanation
+          // is what made this tab look broken instead of unsupported.
+          churnError:
+            churnRes.status === "rejected"
+              ? churnRes.reason instanceof Error
+                ? churnRes.reason.message
+                : "Follower churn is unavailable."
+              : null,
+          cta: ctaRes.status === "fulfilled" ? ctaRes.value : null,
+          history: histRes.status === "fulfilled" ? histRes.value : null,
+        };
+      },
+      [pageId, startDate, endDate],
+      { interval: 300_000, enabled: false }
+    );
+
+  if (loading)
+    return (
+      <div className="text-center py-16 text-muted text-sm">
+        Loading audience data...
+      </div>
+    );
+  if (error)
+    return <div className="text-center py-16 text-red text-sm">{error}</div>;
+
+  const { churn, churnError, cta, history } = data ?? ({} as AudienceData);
+
+  const churnPoints = churn?.points ?? [];
+  const totals = churnPoints.reduce(
+    (acc, p) => ({
+      adds: acc.adds + (p.metrics.fanAdds ?? 0),
+      removes: acc.removes + (p.metrics.fanRemoves ?? 0),
+    }),
+    { adds: 0, removes: 0 }
+  );
+  const netChange = totals.adds - totals.removes;
+  // Null rather than 0 when nobody followed: 0/0 is not a ratio.
+  const churnRatio = totals.adds > 0 ? totals.removes / totals.adds : null;
+
+  const ctaPoints = cta?.points ?? [];
+  const ctaTotal = ctaPoints.reduce(
+    (sum, p) => sum + (p.metrics.totalActions ?? 0),
+    0
+  );
+
+  // "last", not "sum": a follower count is a running total, so a month bucket
+  // takes the value it ended on. Summing would report 700k followers for a
+  // page that has 23k.
+  const followerChart = bucketSeries(
+    (history?.points ?? []).map((p) => ({
+      date: p.date,
+      followers: p.followersCount,
+    })),
+    grouping,
+    { followers: "last" }
+  );
+
+  // Derived from THIS page's points, on every render — switching pages or
+  // ranges refetches, which recomputes the bounds. Nothing here is shared
+  // between pages or fixed ahead of time.
+  const followerDomain = fitAxisDomain(
+    followerChart.map((p) => Number(p.followers))
+  );
+
+  // Meta's insights API has period=day|week|days_28|lifetime — there is no
+  // month period and no endpoint that returns one. Monthly is the daily series
+  // bucketed client-side, which is exact for additive counts like these.
+  const groupedChart = bucketSeries(
+    churnPoints.map((p) => ({
+      date: p.date,
+      follows: p.metrics.fanAdds ?? 0,
+      unfollows: p.metrics.fanRemoves ?? 0,
+    })),
+    grouping,
+    { follows: "sum", unfollows: "sum" }
+  );
+
+  return (
+    <>
+      <div className="flex flex-wrap items-center justify-between gap-3 mb-3">
+        <div className="flex flex-wrap items-center gap-2.5">
+          {/* The window comes from the topbar selector; this only chooses how
+              that window is bucketed for the charts. */}
+          <SB_Select
+            options={GROUPING_OPTIONS}
+            value={grouping}
+            onChange={(v) => setGrouping(v as "day" | "month")}
+          />
+          <span className="text-xs text-muted">{label}</span>
+        </div>
+        <div className="flex items-center gap-3">
+          <button
+            type="button"
+            onClick={refresh}
+            className="text-xs text-brand hover:underline"
+          >
+            Refresh
+          </button>
+          <SB_LiveIndicator
+            isLive={isLive}
+            lastUpdated={lastUpdated}
+            onToggle={setLive}
+          />
+        </div>
+      </div>
+
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3.5">
+        <SB_MetricCard title="New Follows" value={formatNumber(totals.adds)} />
+        <SB_MetricCard title="Unfollows" value={formatNumber(totals.removes)} />
+        <SB_MetricCard
+          title="Net Change"
+          value={`${netChange >= 0 ? "+" : "-"}${formatNumber(Math.abs(netChange))}`}
+          change={churnPoints.length ? `over ${days} days` : undefined}
+          changeDirection={netChange >= 0 ? "up" : "down"}
+        />
+        <SB_MetricCard
+          title="Churn Ratio"
+          value={churnRatio === null ? "—" : churnRatio.toFixed(2)}
+        />
+      </div>
+
+      {churnError && (
+        <div className="mt-4">
+          <SB_Card>
+            <strong className="text-sm">Follower churn unavailable</strong>
+            <p className="text-xs text-muted mt-2 leading-relaxed">{churnError}</p>
+          </SB_Card>
+        </div>
+      )}
+
+      {groupedChart.length > 0 && (
+        <div className="mt-4">
+          <SB_Card>
+            <strong className="text-sm">
+              Follows vs Unfollows ({grouping === "day" ? "daily" : "monthly"})
+            </strong>
+            <div className="mt-3">
+              <SB_LineChart
+                data={groupedChart}
+                lines={[
+                  { dataKey: "follows", color: "#22b573", name: "Follows" },
+                  { dataKey: "unfollows", color: "#e84a5f", name: "Unfollows" },
+                ]}
+                height={260}
+                showLegend
+              />
+            </div>
+            {grouping === "month" && groupedChart.length < 2 && (
+              <p className="text-[11px] text-muted mt-3">
+                The selected range covers one calendar month, so the monthly view
+                has a single point. Widen the range to compare months.
+              </p>
+            )}
+          </SB_Card>
+        </div>
+      )}
+
+      <div className="grid grid-cols-1 lg:grid-cols-[2fr_1fr] gap-4 mt-4">
+        <SB_Card>
+          <strong className="text-sm">Follower Total</strong>
+          {followerChart.length > 1 ? (
+            <div className="mt-3">
+              <SB_LineChart
+                data={followerChart}
+                lines={[{ dataKey: "followers", color: "#356df3", name: "Followers" }]}
+                height={240}
+                yDomain={followerDomain}
+                yTickFormatter={(v) => v.toLocaleString()}
+              />
+            </div>
+          ) : (
+            <p className="text-xs text-muted mt-2 leading-relaxed">
+              The warehouse holds{" "}
+              {followerChart.length === 1 ? "a single day" : "no days"} in this
+              window, so there is no line to draw yet. The nightly ingestion job
+              adds one point per day.
+            </p>
+          )}
+        </SB_Card>
+
+        <SB_Card>
+          <strong className="text-sm">Conversion Actions</strong>
+          {ctaPoints.length === 0 ? (
+            <div className="text-center py-8 text-muted text-sm">
+              No conversion data for this range
+            </div>
+          ) : (
+            <SB_MiniList
+              className="mt-3"
+              items={[
+                { label: "Total Actions", value: <b>{formatNumber(ctaTotal)}</b> },
+                { label: "Days Counted", value: <b>{formatNumber(ctaPoints.length)}</b> },
+              ]}
+            />
+          )}
+        </SB_Card>
+      </div>
+    </>
+  );
+}
+
+// ─── Posts Tab ──────────────────────────────────────────────
+
+function PostsTab({ pageId }: { pageId: string }) {
+  const { startDate, endDate, label } = useDateRange();
+  const [selected, setSelected] = useState<StoredPostDto | null>(null);
+
+  // The list comes from the warehouse: no Graph call, so it costs no rate
+  // limit and can poll. The per-post metrics behind a row are the expensive
+  // part, so they load only when a post is opened — see SB_PostDetail.
+  // Filtered server-side: warehouse/posts bounds created_time with from/to,
+  // so the window is applied in SQL rather than by discarding rows here.
   const { data: posts, loading, error, lastUpdated, isLive, setLive } = useLiveData<StoredPostDto[]>(
-    () => fb.getStoredPosts(pageId),
-    [pageId],
+    () => fb.getStoredPosts(pageId, startDate, endDate),
+    [pageId, startDate, endDate],
     { interval: POLL_INTERVAL }
   );
 
+  // Hooks must run on every render, so pagination is computed before the
+  // early returns below rather than after them.
+  const paged = usePagination<StoredPostDto>(posts, undefined, `${pageId}:${startDate}`);
+
   if (loading) return <div className="text-center py-16 text-muted text-sm">Loading posts...</div>;
   if (error) return <div className="text-center py-16 text-red text-sm">{error}</div>;
-  if (!posts || posts.length === 0) return <div className="text-center py-16 text-muted text-sm">No posts found</div>;
+  if (!posts || posts.length === 0)
+    return (
+      <div className="text-center py-16 text-muted text-sm">
+        No posts published in this window ({label.toLowerCase()}).
+      </div>
+    );
 
   const columns: Column<StoredPostDto>[] = [
     {
       header: "Post",
+      // No thumbnail: full_picture is a signed CDN url that expires roughly two
+      // days after Meta mints it, so a stored one is dead more often than not.
       accessor: (row) => (
-        <div className="max-w-[300px] truncate text-[13px]">
+        <div className="max-w-[420px] truncate text-[13px]">
           {row.message || <span className="text-muted italic">No text</span>}
         </div>
       ),
     },
     {
       header: "Type",
-      accessor: (row) => <SB_Badge variant="facebook">{row.type || "post"}</SB_Badge>,
+      // Meta's raw status_type is kept in the tooltip so nothing is lost.
+      accessor: (row) => (
+        <span title={row.type ?? "unknown status_type"}>
+          <SB_Badge variant="facebook">{postTypeLabel(row.type)}</SB_Badge>
+        </span>
+      ),
     },
-    { header: "Date", accessor: (row) => new Date(row.createdTime).toLocaleDateString() },
+    {
+      header: "Date",
+      accessor: (row) =>
+        row.createdTime ? new Date(row.createdTime).toLocaleDateString() : "—",
+    },
     { header: "Shares", accessor: (row) => formatNumber(row.sharesCount), className: "text-right" },
     {
       header: "Link",
       accessor: (row) =>
         row.permalinkUrl ? (
-          <a href={row.permalinkUrl} target="_blank" rel="noopener noreferrer" className="text-brand hover:underline text-xs">
+          <a
+            href={row.permalinkUrl}
+            target="_blank"
+            rel="noopener noreferrer"
+            // The row itself opens the metrics modal, so the link has to stop
+            // the click bubbling or every "view post" also pops a dialog.
+            onClick={(e) => e.stopPropagation()}
+            className="text-brand hover:underline text-xs whitespace-nowrap"
+          >
             View ↗
           </a>
-        ) : ("—"),
+        ) : (
+          <span className="text-muted text-xs">—</span>
+        ),
+    },
+    {
+      header: "",
+      accessor: () => <span className="text-brand text-xs whitespace-nowrap">Metrics →</span>,
+      className: "text-right",
     },
   ];
 
@@ -242,165 +622,71 @@ function ContentTab({ pageId }: { pageId: string }) {
       <div className="flex justify-end mb-3">
         <SB_LiveIndicator isLive={isLive} lastUpdated={lastUpdated} onToggle={setLive} />
       </div>
+
       <SB_Card>
-        <strong className="text-sm">Published Content ({posts.length})</strong>
+        <div className="flex items-baseline justify-between gap-3">
+          <strong className="text-sm">
+            Posts ({posts.length}) · {label}
+          </strong>
+          <span className="text-[11px] text-muted">
+            Select a row for live metrics, or View to open it on Facebook
+          </span>
+        </div>
         <div className="mt-3">
-          <SB_DataTable columns={columns} data={posts} />
+          <SB_DataTable columns={columns} data={paged.pageItems} onRowClick={setSelected} />
         </div>
+        <SB_Pagination
+          label="posts"
+          page={paged.page}
+          pageCount={paged.pageCount}
+          pageSize={paged.pageSize}
+          total={paged.total}
+          firstShown={paged.firstShown}
+          lastShown={paged.lastShown}
+          onPageChange={paged.setPage}
+          onPageSizeChange={paged.setPageSize}
+        />
       </SB_Card>
-    </>
-  );
-}
 
-// ─── Audience Tab ───────────────────────────────────────────
-
-interface AudienceData {
-  demographics: PageDemographicDto[];
-  fanChurn: PageFanChurnDto | null;
-  likeSources: PageLikeSourceDto[];
-}
-
-function AudienceTab({ pageId }: { pageId: string }) {
-  const { data, loading, error, lastUpdated, isLive, setLive } = useLiveData<AudienceData>(
-    async () => {
-      const [demRes, churnRes, srcRes] = await Promise.allSettled([
-        fb.getPageDemographics(pageId),
-        fb.getPageFanChurn(pageId),
-        fb.getPageLikeSources(pageId),
-      ]);
-      return {
-        demographics: demRes.status === "fulfilled" ? demRes.value : [],
-        fanChurn: churnRes.status === "fulfilled" ? churnRes.value : null,
-        likeSources: srcRes.status === "fulfilled" ? srcRes.value : [],
-      };
-    },
-    [pageId],
-    { interval: POLL_INTERVAL }
-  );
-
-  if (loading) return <div className="text-center py-16 text-muted text-sm">Loading audience data...</div>;
-  if (error) return <div className="text-center py-16 text-red text-sm">{error}</div>;
-
-  const { demographics = [], fanChurn = null, likeSources = [] } = data ?? {};
-
-  const genderAge = demographics.filter((d) => d.demographicType === "gender_age");
-  const countries = demographics.filter((d) => d.demographicType === "country");
-  const cities = demographics.filter((d) => d.demographicType === "city");
-
-  const genderGroups = genderAge.reduce(
-    (acc, d) => {
-      const gender = d.dimension.startsWith("F.") ? "Female" : d.dimension.startsWith("M.") ? "Male" : "Other";
-      acc[gender] = (acc[gender] || 0) + d.count;
-      return acc;
-    },
-    {} as Record<string, number>
-  );
-  const genderDonut = [
-    { name: "Female", value: genderGroups["Female"] || 0, color: "#ef4b9a" },
-    { name: "Male", value: genderGroups["Male"] || 0, color: "#356df3" },
-    { name: "Other", value: genderGroups["Other"] || 0, color: "#ff9f43" },
-  ].filter((g) => g.value > 0);
-  const totalGender = genderDonut.reduce((s, g) => s + g.value, 0);
-
-  const topCountries = [...countries].sort((a, b) => b.count - a.count).slice(0, 10);
-  const maxCountry = topCountries[0]?.count || 1;
-  const topCities = [...cities].sort((a, b) => b.count - a.count).slice(0, 10);
-
-  return (
-    <>
-      <div className="flex justify-end mb-3">
-        <SB_LiveIndicator isLive={isLive} lastUpdated={lastUpdated} onToggle={setLive} />
-      </div>
-
-      <div className="grid grid-cols-1 lg:grid-cols-[2fr_1fr] gap-4">
-        <SB_Card>
-          <strong className="text-sm">Gender Distribution</strong>
-          {genderDonut.length > 0 ? (
-            <div className="flex flex-col sm:flex-row items-center gap-6 mt-4">
-              <SB_DonutChart data={genderDonut} centerValue={formatNumber(totalGender)} centerLabel="Fans" size={160} />
-              <div className="flex flex-col gap-2">
-                {genderDonut.map((g) => (
-                  <div key={g.name} className="flex items-center gap-2 text-sm">
-                    <span className="w-3 h-3 rounded-full" style={{ backgroundColor: g.color }} />
-                    <span className="text-muted">{g.name}</span>
-                    <span className="font-bold ml-auto">{formatPercentage((g.value / totalGender) * 100)}</span>
-                  </div>
-                ))}
-              </div>
-            </div>
-          ) : (
-            <div className="text-center py-8 text-muted text-sm">No demographic data</div>
-          )}
-        </SB_Card>
-
-        <SB_Card>
-          <strong className="text-sm">Fan Growth</strong>
-          {fanChurn ? (
-            <SB_MiniList
-              className="mt-3"
-              items={[
-                { label: "New Fans", value: <b className="text-green">+{formatNumber(fanChurn.fanAdds)}</b> },
-                { label: "Lost Fans", value: <b className="text-red">-{formatNumber(fanChurn.fanRemoves)}</b> },
-                {
-                  label: "Net Change",
-                  value: (
-                    <b className={fanChurn.netChange >= 0 ? "text-green" : "text-red"}>
-                      {fanChurn.netChange >= 0 ? "+" : ""}{formatNumber(fanChurn.netChange)}
-                    </b>
-                  ),
-                },
-                { label: "Churn Ratio", value: <b>{formatPercentage(fanChurn.churnRatio * 100)}</b> },
-              ]}
-            />
-          ) : (
-            <div className="text-center py-8 text-muted text-sm">No churn data</div>
-          )}
-        </SB_Card>
-      </div>
-
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mt-4">
-        <SB_Card>
-          <strong className="text-sm">Top Countries</strong>
-          <div className="mt-3 grid gap-2.5">
-            {topCountries.length > 0 ? (
-              topCountries.map((c) => (
-                <div key={c.dimension}>
-                  <div className="flex items-center justify-between text-xs mb-1">
-                    <span>{c.dimension}</span>
-                    <span className="font-bold">{formatNumber(c.count)}</span>
-                  </div>
-                  <SB_ProgressBar value={(c.count / maxCountry) * 100} />
-                </div>
-              ))
-            ) : (
-              <div className="text-center py-6 text-muted text-sm">No country data</div>
+      <SB_Modal
+        open={!!selected}
+        onClose={() => setSelected(null)}
+        title={
+          selected?.message
+            ? selected.message.slice(0, 80) + (selected.message.length > 80 ? "…" : "")
+            : "Post"
+        }
+        subtitle={
+          selected
+            ? [
+                postTypeLabel(selected.type),
+                selected.createdTime
+                  ? new Date(selected.createdTime).toLocaleString()
+                  : null,
+                selected.isDeleted ? "deleted" : null,
+              ]
+                .filter(Boolean)
+                .join(" · ")
+            : ""
+        }
+        maxWidth="980px"
+      >
+        {selected && (
+          <>
+            {selected.permalinkUrl && (
+              <a
+                href={selected.permalinkUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-brand hover:underline text-xs mb-3 inline-block"
+              >
+                View on Facebook ↗
+              </a>
             )}
-          </div>
-        </SB_Card>
-
-        <SB_Card>
-          <strong className="text-sm">Top Cities</strong>
-          {topCities.length > 0 ? (
-            <SB_MiniList className="mt-3" items={topCities.map((c) => ({ label: c.dimension, value: <b>{formatNumber(c.count)}</b> }))} />
-          ) : (
-            <div className="text-center py-6 text-muted text-sm">No city data</div>
-          )}
-        </SB_Card>
-      </div>
-
-      {likeSources.length > 0 && (
-        <div className="mt-4">
-          <SB_Card>
-            <strong className="text-sm">Where Likes Come From</strong>
-            <SB_MiniList
-              className="mt-3"
-              items={[...likeSources].sort((a, b) => b.fanCount - a.fanCount).slice(0, 10).map((s) => ({
-                label: s.source, value: <b>{formatNumber(s.fanCount)}</b>,
-              }))}
-            />
-          </SB_Card>
-        </div>
-      )}
+            <SB_PostDetail post={selected} />
+          </>
+        )}
+      </SB_Modal>
     </>
   );
 }
@@ -409,29 +695,62 @@ function AudienceTab({ pageId }: { pageId: string }) {
 
 interface VideosData {
   videos: PageVideoDto[];
-  videoMetrics: PageVideoMetricsDto | null;
+  videoMetrics: PageVideoMetricsSeries | null;
 }
 
 function VideosTab({ pageId }: { pageId: string }) {
+  const { startDate, endDate, label } = useDateRange();
+
   const { data, loading, error, lastUpdated, isLive, setLive } = useLiveData<VideosData>(
     async () => {
       const [vidRes, metRes] = await Promise.allSettled([
+        // The videos endpoint takes no date parameters — only pageId — so the
+        // catalogue arrives whole and the window is applied below.
         fb.getPageVideos(pageId),
-        fb.getPageVideoMetrics(pageId),
+        fb.getPageVideoMetrics(pageId, startDate, endDate),
       ]);
       return {
         videos: vidRes.status === "fulfilled" ? vidRes.value : [],
         videoMetrics: metRes.status === "fulfilled" ? metRes.value : null,
       };
     },
-    [pageId],
-    { interval: POLL_INTERVAL }
+    [pageId, startDate, endDate],
+    { interval: 300_000, enabled: false }
+  );
+
+  const { videos: allVideos = [], videoMetrics = null } = data ?? {};
+
+  // Filtered client-side because the endpoint offers no date bounds. Keeping
+  // the full catalogue lets the empty state explain itself rather than just
+  // reporting nothing.
+  const videos = allVideos.filter((v) => {
+    if (!v.createdTime) return false;
+    const day = v.createdTime.slice(0, 10);
+    return day >= startDate && day <= endDate;
+  });
+
+  // Daily counts, so the window's figure is their sum.
+  const sumVideo = (pick: (m: PageVideoMetricsDto) => number | undefined) =>
+    (videoMetrics?.points ?? []).reduce(
+      (total, p) => total + (pick(p.metrics) ?? 0),
+      0
+    );
+
+  const newestVideo = allVideos
+    .map((v) => v.createdTime)
+    .filter(Boolean)
+    .sort()
+    .pop();
+
+  // Hooks run unconditionally, so this sits above the early returns.
+  const paged = usePagination<PageVideoDto>(
+    videos,
+    undefined,
+    `${pageId}:${startDate}`
   );
 
   if (loading) return <div className="text-center py-16 text-muted text-sm">Loading videos...</div>;
   if (error) return <div className="text-center py-16 text-red text-sm">{error}</div>;
-
-  const { videos = [], videoMetrics = null } = data ?? {};
 
   const columns: Column<PageVideoDto>[] = [
     {
@@ -446,7 +765,11 @@ function VideosTab({ pageId }: { pageId: string }) {
       header: "Description",
       accessor: (row) => <div className="max-w-[200px] truncate text-[12px] text-muted">{row.description || "—"}</div>,
     },
-    { header: "Published", accessor: (row) => new Date(row.createdTime).toLocaleDateString() },
+    {
+      header: "Published",
+      accessor: (row) =>
+        row.createdTime ? new Date(row.createdTime).toLocaleDateString() : "—",
+    },
   ];
 
   return (
@@ -455,80 +778,65 @@ function VideosTab({ pageId }: { pageId: string }) {
         <SB_LiveIndicator isLive={isLive} lastUpdated={lastUpdated} onToggle={setLive} />
       </div>
       {videoMetrics && (
-        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3.5 mb-4">
-          <SB_MetricCard title="Total Views" value={formatNumber(videoMetrics.videoViews)} />
-          <SB_MetricCard title="Paid Views" value={formatNumber(videoMetrics.videoViewsPaid)} />
-          <SB_MetricCard title="Organic Views" value={formatNumber(videoMetrics.videoViewsOrganic)} />
-          <SB_MetricCard title="Unique Views" value={formatNumber(videoMetrics.videoViewsUnique)} />
-          <SB_MetricCard title="30s Completes" value={formatNumber(videoMetrics.videoCompleteViews30s)} />
-          <SB_MetricCard title="Watch Time" value={`${Math.round(videoMetrics.videoViewTimeMs / 60000)}m`} />
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3.5 mb-4">
+          <SB_MetricCard title="Total Views" value={formatNumber(sumVideo((m) => m.videoViews))} />
+          <SB_MetricCard title="Organic Views" value={formatNumber(sumVideo((m) => m.videoViewsOrganic))} />
+          <SB_MetricCard title="30s Completes" value={formatNumber(sumVideo((m) => m.videoCompleteViews30s))} />
+          <SB_MetricCard
+            title="Watch Time"
+            value={`${Math.round(sumVideo((m) => m.videoViewTimeMs) / 60000)}m`}
+          />
         </div>
       )}
       <SB_Card>
-        <strong className="text-sm">Videos ({videos.length})</strong>
+        <strong className="text-sm">
+          Videos ({videos.length}) · {label}
+        </strong>
         {videos.length > 0 ? (
-          <div className="mt-3"><SB_DataTable columns={columns} data={videos} /></div>
+          <>
+            <div className="mt-3">
+              <SB_DataTable columns={columns} data={paged.pageItems} />
+            </div>
+            <SB_Pagination
+              label="videos"
+              page={paged.page}
+              pageCount={paged.pageCount}
+              pageSize={paged.pageSize}
+              total={paged.total}
+              firstShown={paged.firstShown}
+              lastShown={paged.lastShown}
+              onPageChange={paged.setPage}
+              onPageSizeChange={paged.setPageSize}
+            />
+          </>
         ) : (
-          <div className="text-center py-8 text-muted text-sm">No videos found</div>
+          <div className="text-center py-8 text-muted text-sm">
+            {allVideos.length === 0 ? (
+              "No videos on this page"
+            ) : (
+              <>
+                None of this page&apos;s {formatNumber(allVideos.length)} videos were
+                published in this window.
+                {newestVideo && (
+                  <>
+                    {" "}
+                    The most recent was{" "}
+                    {new Date(newestVideo).toLocaleDateString("en-US", {
+                      month: "long",
+                      year: "numeric",
+                    })}
+                    .
+                  </>
+                )}
+                <div className="mt-1 text-[11px]">
+                  The view counts above still cover {label.toLowerCase()} — an old
+                  catalogue keeps earning views.
+                </div>
+              </>
+            )}
+          </div>
         )}
       </SB_Card>
-    </>
-  );
-}
-
-// ─── Stories Tab ─────────────────────────────────────────────
-
-function StoriesTab({ pageId }: { pageId: string }) {
-  const { data: storyMetrics, loading, error, lastUpdated, isLive, setLive } = useLiveData(
-    () => fb.getPageStoryMetrics(pageId),
-    [pageId],
-    { interval: POLL_INTERVAL }
-  );
-
-  if (loading) return <div className="text-center py-16 text-muted text-sm">Loading story metrics...</div>;
-  if (error) return <div className="text-center py-16 text-red text-sm">{error}</div>;
-  if (!storyMetrics) return <div className="text-center py-16 text-muted text-sm">No story data</div>;
-
-  const actionsDonut = [
-    { name: "Fan Actions", value: storyMetrics.actionFan, color: "#356df3" },
-    { name: "Mentions", value: storyMetrics.actionMention, color: "#ef4b9a" },
-    { name: "Page Posts", value: storyMetrics.actionPagePost, color: "#22b573" },
-    { name: "User Posts", value: storyMetrics.actionUserPost, color: "#ff9f43" },
-    { name: "Checkins", value: storyMetrics.actionCheckin, color: "#8a96aa" },
-    { name: "Other", value: storyMetrics.actionOther, color: "#e84a5f" },
-  ].filter((a) => a.value > 0);
-  const totalActions = actionsDonut.reduce((s, a) => s + a.value, 0);
-
-  return (
-    <>
-      <div className="flex justify-end mb-3">
-        <SB_LiveIndicator isLive={isLive} lastUpdated={lastUpdated} onToggle={setLive} />
-      </div>
-      <div className="grid grid-cols-2 md:grid-cols-3 gap-3.5">
-        <SB_MetricCard title="Story Adds" value={formatNumber(storyMetrics.storyAdds)} />
-        <SB_MetricCard title="Unique Story Adds" value={formatNumber(storyMetrics.storyAddsUnique)} />
-        <SB_MetricCard title="Total Actions" value={formatNumber(totalActions)} />
-      </div>
-
-      {actionsDonut.length > 0 && (
-        <div className="mt-4">
-          <SB_Card>
-            <strong className="text-sm">Story Actions Breakdown</strong>
-            <div className="flex flex-col sm:flex-row items-center gap-6 mt-4">
-              <SB_DonutChart data={actionsDonut} centerValue={formatNumber(totalActions)} centerLabel="Actions" size={180} />
-              <div className="flex flex-col gap-2 flex-1">
-                {actionsDonut.map((a) => (
-                  <div key={a.name} className="flex items-center gap-2 text-sm">
-                    <span className="w-3 h-3 rounded-full shrink-0" style={{ backgroundColor: a.color }} />
-                    <span className="text-muted">{a.name}</span>
-                    <span className="font-bold ml-auto">{formatNumber(a.value)}</span>
-                  </div>
-                ))}
-              </div>
-            </div>
-          </SB_Card>
-        </div>
-      )}
     </>
   );
 }
@@ -538,12 +846,13 @@ function StoriesTab({ pageId }: { pageId: string }) {
 export default function FacebookPage() {
   const [activeTab, setActiveTab] = useState("overview");
   const {
-    accounts,
-    selectedAccount,
-    setAccount,
     pages,
     selectedPage,
     setPage,
+    needsLogin,
+    loginUrl,
+    syncPages,
+    syncing,
     loading,
     error,
   } = useFbAccount();
@@ -554,10 +863,9 @@ export default function FacebookPage() {
     if (!pageId) return null;
     switch (activeTab) {
       case "overview":   return <OverviewTab pageId={pageId} />;
-      case "content":    return <ContentTab pageId={pageId} />;
       case "audience":   return <AudienceTab pageId={pageId} />;
+      case "posts":      return <PostsTab pageId={pageId} />;
       case "videos":     return <VideosTab pageId={pageId} />;
-      case "stories":    return <StoriesTab pageId={pageId} />;
       default:           return <OverviewTab pageId={pageId} />;
     }
   }, [activeTab, pageId]);
@@ -574,22 +882,14 @@ export default function FacebookPage() {
         actionLabel="＋ Create"
       />
 
-      {/* Account & Page selectors */}
+      {/* Page selector. The Meta account is resolved by the hook and sent as
+          X-Account-Id on every call — it has no picker because it is not a
+          choice the dashboard asks anyone to make. */}
       <div className="flex flex-wrap items-center gap-3 mb-4">
         {loading ? (
-          <span className="text-sm text-muted">Loading accounts...</span>
+          <span className="text-sm text-muted">Loading pages...</span>
         ) : (
           <>
-            {accounts.length > 0 && (
-              <SB_Select
-                options={accounts.map((a) => ({
-                  label: a.label,
-                  value: a.accountId,
-                }))}
-                value={selectedAccount?.accountId ?? ""}
-                onChange={setAccount}
-              />
-            )}
             {pages.length > 0 && (
               <SB_Select
                 options={pages.map((p) => ({
@@ -600,6 +900,19 @@ export default function FacebookPage() {
                 onChange={setPage}
               />
             )}
+            {/* Re-runs discovery against Meta and re-reads the registry. Slow
+                — one SQL statement per business and per page — so it stays a
+                deliberate action rather than something the page does on load. */}
+            {!needsLogin && (
+              <button
+                type="button"
+                onClick={syncPages}
+                disabled={syncing}
+                className="text-xs text-brand hover:underline disabled:opacity-50 disabled:no-underline"
+              >
+                {syncing ? "Syncing pages..." : "Sync pages"}
+              </button>
+            )}
           </>
         )}
       </div>
@@ -607,22 +920,29 @@ export default function FacebookPage() {
       <SB_Tabs
         tabs={[
           { label: "Overview", value: "overview" },
-          { label: "Content", value: "content" },
           { label: "Audience", value: "audience" },
+          { label: "Posts", value: "posts" },
           { label: "Videos", value: "videos" },
-          { label: "Stories", value: "stories" },
         ]}
         activeTab={activeTab}
         onTabChange={setActiveTab}
       />
 
       {loading ? (
-        <div className="text-center py-16 text-muted text-sm">Loading accounts...</div>
+        <div className="text-center py-16 text-muted text-sm">Loading pages...</div>
       ) : error ? (
         <div className="text-center py-16 text-red text-sm">{error}</div>
+      ) : needsLogin ? (
+        <div className="text-center py-16 text-muted text-sm">
+          No Meta account is linked.{" "}
+          <a href={loginUrl} className="text-brand hover:underline">
+            Open the Facebook login
+          </a>{" "}
+          to link one — it must run in a real browser tab, not a fetch.
+        </div>
       ) : !pageId ? (
         <div className="text-center py-16 text-muted text-sm">
-          No Facebook page found. Link an account to get started.
+          No Facebook page found for this account. Try a page sync.
         </div>
       ) : (
         renderTab()
