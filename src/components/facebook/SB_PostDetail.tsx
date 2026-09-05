@@ -1,7 +1,7 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
-import { User } from "lucide-react";
+import { useEffect, useState } from "react";
+import { RefreshCw, User } from "lucide-react";
 import SB_Card from "@/components/ui/SB_Card";
 import SB_MetricCard from "@/components/ui/SB_MetricCard";
 import SB_MiniList from "@/components/ui/SB_MiniList";
@@ -47,35 +47,49 @@ const REACTION_COLORS: Record<string, string> = {
 /**
  * Opening one post costs roughly ten Graph calls — post-reactions alone is six,
  * one per reaction type, and is documented as the most rate-limit-expensive
- * endpoint in the API. So this fetches once when a post is opened, never polls,
- * and keeps what it fetched: re-opening the same post is free.
+ * endpoint in the API.
+ *
+ * Nothing here polls. Opening the modal reads live, and the Refresh control
+ * re-reads on demand.
  */
 export default function SB_PostDetail({ post }: { post: StoredPostDto }) {
   const [data, setData] = useState<PostDetailData | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const cache = useRef(new Map<string, PostDetailData>());
 
+  const [refreshing, setRefreshing] = useState(false);
+  const [reloadKey, setReloadKey] = useState(0);
+  const refresh = () => setReloadKey((k) => k + 1);
+
+  /**
+   * Opening a post always reads live.
+   *
+   * The API caches post counts in SQL with no time expiry — only a Facebook
+   * webhook refreshes them — so a like made moments ago reads as 0 until that
+   * event lands. This component used to hold its own per-post map on top of
+   * that, which meant reopening a post could not correct the number either.
+   *
+   * Both caches are now bypassed: opening the modal is a deliberate action,
+   * and showing a stale count at that moment is worse than the Graph calls it
+   * costs. The trade is that reopening the same post pays for the reads again.
+   */
   useEffect(() => {
     let cancelled = false;
     const postId = post.postId;
-
-    const cached = cache.current.get(postId);
-    if (cached) {
-      setData(cached);
-      setLoading(false);
-      setError(null);
-      return;
-    }
+    const isReload = reloadKey > 0;
 
     (async () => {
-      setLoading(true);
+      if (isReload) setRefreshing(true);
+      else setLoading(true);
       setError(null);
 
       // Non-video posts return zeros from post-video-metrics, so skip the call
       // rather than spend a Graph request confirming a row of noughts.
       const isVideo = VIDEO_TYPES.has(post.type ?? "");
 
+      // refresh=true is only accepted by the read-through cached endpoints.
+      // post-engagement, post-attachments and post-video-metrics are always
+      // live, so they need no flag.
       const [
         likesRes,
         reactionsRes,
@@ -85,10 +99,10 @@ export default function SB_PostDetail({ post }: { post: StoredPostDto }) {
         historyRes,
         videoRes,
       ] = await Promise.allSettled([
-        fb.getPostLikes(postId),
-        fb.getPostReactions(postId),
+        fb.getPostLikes(postId, true),
+        fb.getPostReactions(postId, true),
         fb.getPostEngagement(postId),
-        fb.getPostComments(postId),
+        fb.getPostComments(postId, true),
         fb.getPostAttachments(postId),
         fb.getPostMetricsHistory(postId),
         isVideo ? fb.getPostVideoMetrics(postId) : Promise.resolve(null),
@@ -126,18 +140,17 @@ export default function SB_PostDetail({ post }: { post: StoredPostDto }) {
             ? reason.message
             : "Could not load metrics for this post."
         );
-      } else {
-        cache.current.set(postId, next);
       }
 
       setData(next);
       setLoading(false);
+      setRefreshing(false);
     })();
 
     return () => {
       cancelled = true;
     };
-  }, [post.postId, post.type]);
+  }, [post.postId, post.type, reloadKey]);
 
   if (loading) {
     return (
@@ -180,6 +193,25 @@ export default function SB_PostDetail({ post }: { post: StoredPostDto }) {
 
   return (
     <div className="grid gap-4">
+      {/* Likes, reactions and comments are served from the API's stored copy
+          and refreshed by a Facebook webhook, not on a timer — so a like made
+          seconds ago can still read as 0 until that event lands. This forces a
+          live read past both the API's cache and this component's. */}
+      <div className="flex items-center justify-end gap-3 -mb-1">
+        <span className="text-[11px] text-muted">
+          Counts read live each time this opens
+        </span>
+        <button
+          type="button"
+          onClick={refresh}
+          disabled={refreshing}
+          className="inline-flex items-center gap-1.5 text-xs text-brand hover:underline disabled:opacity-50 disabled:no-underline"
+        >
+          <RefreshCw size={13} className={refreshing ? "animate-spin" : ""} />
+          {refreshing ? "Refreshing…" : "Refresh now"}
+        </button>
+      </div>
+
       {/* Headline numbers */}
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3.5">
         <SB_MetricCard
