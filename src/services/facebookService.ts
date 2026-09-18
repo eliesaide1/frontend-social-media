@@ -59,7 +59,6 @@ import {
   HealthDto,
   IngestionRunResultDto,
   IngestionStatusDto,
-  CacheStatusDto,
   WebhookSubscriptionResult,
 } from "@/types/facebook";
 
@@ -746,15 +745,5 @@ export function runIngestion(
 export function getIngestionStatus() {
   return fbApiClient.get<IngestionStatusDto>(
     "/api/operations/ingestion-status"
-  );
-}
-
-/**
- * Which of a page's resources are served from SQL Server and which will call
- * Meta on the next read — the answer to "why is this number old?".
- */
-export function getCacheStatus(pageId: string) {
-  return fbApiClient.get<CacheStatusDto>(
-    `/api/operations/cache-status${qs({ pageId })}`
   );
 }

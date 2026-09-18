@@ -24,8 +24,10 @@ import {
 } from "@/lib/utils";
 import { useFbAccount } from "@/hooks/useFbAccount";
 import { useLiveData } from "@/hooks/useLiveData";
+// Reads come from SQL Server via Server Actions; the .NET API is still used for
+// anything that has to reach Meta (publishing, moderation, account linking).
+import * as sqlfb from "@/server/facebookActions";
 import { useDateRange } from "@/contexts/DateRangeContext";
-import * as fb from "@/services/facebookService";
 import type {
   PageInsightsSeries,
   PageVideoMetricsSeries,
@@ -53,10 +55,11 @@ interface OverviewData {
   history: TimeSeriesResponse<PageMetricPointDto> | null;
 }
 
-function OverviewTab({ pageId }: { pageId: string }) {
+function OverviewTab({ pageId, accountId }: { pageId: string; accountId: string | null }) {
   const { startDate, endDate, grouping } = useDateRange();
 
-  const { data, loading, error, lastUpdated, isLive, setLive } = useLiveData<OverviewData>(
+  const { data, loading, error, lastUpdated, isLive, setLive, realtimeConnected } =
+    useLiveData<OverviewData>(
     async () => {
       // Every metric here is fetched RANGED, so the topbar selector actually
       // changes the numbers. Un-ranged, Meta returns only its default two-day
@@ -66,11 +69,11 @@ function OverviewTab({ pageId }: { pageId: string }) {
       // permissions the token may lack, and one 502 should not blank the tab.
       const [insRes, folRes, vidRes, reactRes, histRes] =
         await Promise.allSettled([
-          fb.getPageInsights(pageId, startDate, endDate),
-          fb.getPageFollowers(pageId),
-          fb.getPageVideoMetrics(pageId, startDate, endDate),
-          fb.getPageReactionsDaily(pageId, startDate, endDate),
-          fb.getPageMetricsHistory(pageId, startDate, endDate),
+          sqlfb.sqlPageInsights(pageId, accountId, startDate, endDate),
+          sqlfb.sqlPageFollowers(pageId, accountId),
+          sqlfb.sqlPageVideoMetrics(pageId, accountId, startDate, endDate),
+          sqlfb.sqlPageReactionsDaily(pageId, accountId, startDate, endDate),
+          sqlfb.sqlPageMetricsHistory(pageId, accountId, startDate, endDate),
         ]);
       return {
         insights: insRes.status === "fulfilled" ? insRes.value : null,
@@ -80,10 +83,19 @@ function OverviewTab({ pageId }: { pageId: string }) {
         history: histRes.status === "fulfilled" ? histRes.value : null,
       };
     },
-    [pageId, startDate, endDate],
-    // Ranged reads are live Graph calls, not the cached flat endpoints, so
-    // this polls far less aggressively than a snapshot would.
-    { interval: 300_000, enabled: false }
+    [pageId, accountId, startDate, endDate],
+    // Warehouse reads now, not Graph calls, so a refresh is cheap and this starts
+    // live. It used to start paused because each ranged read was an expensive
+    // Graph call — and because useLiveData gates the hub subscription on isLive,
+    // starting paused also meant receiving no pushes at all until someone clicked.
+    {
+      interval: 300_000,
+      enabled: true,
+      // Page figures have no webhook of their own; they arrive from the nightly
+      // metrics refresh as PageInsightsChanged. PostChanged is included because
+      // publishing moves the page's post-engagement totals too.
+      realtime: { pageId, events: ["PageInsightsChanged", "PostChanged"] },
+    }
   );
 
   if (loading) return <div className="text-center py-16 text-muted text-sm">Loading overview data...</div>;
@@ -170,7 +182,12 @@ function OverviewTab({ pageId }: { pageId: string }) {
   return (
     <>
       <div className="flex justify-end mb-3">
-        <SB_LiveIndicator isLive={isLive} lastUpdated={lastUpdated} onToggle={setLive} />
+        <SB_LiveIndicator
+          isLive={isLive}
+          lastUpdated={lastUpdated}
+          onToggle={setLive}
+          realtimeConnected={realtimeConnected}
+        />
       </div>
 
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3.5">
@@ -316,20 +333,20 @@ interface AudienceData {
   history: TimeSeriesResponse<PageMetricPointDto> | null;
 }
 
-function AudienceTab({ pageId }: { pageId: string }) {
+function AudienceTab({ pageId, accountId }: { pageId: string; accountId: string | null }) {
   const { startDate, endDate, days, label, grouping, setGrouping } =
     useDateRange();
 
-  // These are live Graph reads, not the cached flat endpoints, and a 90-day
-  // insights call is expensive. So no polling by default — the range is the
-  // point of this tab, not second-by-second freshness.
-  const { data, loading, error, lastUpdated, isLive, setLive, refresh } =
-    useLiveData<AudienceData>(
+  // Warehouse reads: a 90-day range is a date-filtered index seek, not a 90-day
+  // Graph call, so this no longer has to trade freshness for cost.
+  const {
+    data, loading, error, lastUpdated, isLive, setLive, refresh, realtimeConnected,
+  } = useLiveData<AudienceData>(
       async () => {
         const [churnRes, ctaRes, histRes] = await Promise.allSettled([
-          fb.getPageFanChurn(pageId, startDate, endDate),
-          fb.getPageCtaClicks(pageId, startDate, endDate),
-          fb.getPageMetricsHistory(pageId, startDate, endDate),
+          sqlfb.sqlPageFanChurn(pageId, accountId, startDate, endDate),
+          sqlfb.sqlPageCtaClicks(pageId, accountId, startDate, endDate),
+          sqlfb.sqlPageMetricsHistory(pageId, accountId, startDate, endDate),
         ]);
 
         return {
@@ -346,8 +363,12 @@ function AudienceTab({ pageId }: { pageId: string }) {
           history: histRes.status === "fulfilled" ? histRes.value : null,
         };
       },
-      [pageId, startDate, endDate],
-      { interval: 300_000, enabled: false }
+      [pageId, accountId, startDate, endDate],
+      {
+        interval: 300_000,
+        enabled: true,
+        realtime: { pageId, events: ["PageInsightsChanged"] },
+      }
     );
 
   if (loading)
@@ -436,6 +457,7 @@ function AudienceTab({ pageId }: { pageId: string }) {
             isLive={isLive}
             lastUpdated={lastUpdated}
             onToggle={setLive}
+            realtimeConnected={realtimeConnected}
           />
         </div>
       </div>
@@ -537,7 +559,7 @@ function AudienceTab({ pageId }: { pageId: string }) {
 
 // ─── Posts Tab ──────────────────────────────────────────────
 
-function PostsTab({ pageId }: { pageId: string }) {
+function PostsTab({ pageId, accountId }: { pageId: string; accountId: string | null }) {
   const { startDate, endDate, label } = useDateRange();
   const [selected, setSelected] = useState<StoredPostDto | null>(null);
 
@@ -546,10 +568,21 @@ function PostsTab({ pageId }: { pageId: string }) {
   // part, so they load only when a post is opened — see SB_PostDetail.
   // Filtered server-side: warehouse/posts bounds created_time with from/to,
   // so the window is applied in SQL rather than by discarding rows here.
-  const { data: posts, loading, error, lastUpdated, isLive, setLive } = useLiveData<StoredPostDto[]>(
-    () => fb.getStoredPosts(pageId, startDate, endDate),
-    [pageId, startDate, endDate],
-    { interval: POLL_INTERVAL }
+  const {
+    data: posts, loading, error, lastUpdated, isLive, setLive, realtimeConnected,
+  } = useLiveData<StoredPostDto[]>(
+    () => sqlfb.sqlStoredPosts(pageId, accountId, startDate, endDate),
+    [pageId, accountId, startDate, endDate],
+    {
+      interval: POLL_INTERVAL,
+      // This list is a warehouse read — no Graph call — so refetching it on any
+      // post-shaped event is cheap, and the webhook has already written the row
+      // by the time the event arrives.
+      realtime: {
+        pageId,
+        events: ["PostChanged", "EngagementChanged", "CommentChanged"],
+      },
+    }
   );
 
   // Hooks must run on every render, so pagination is computed before the
@@ -620,7 +653,12 @@ function PostsTab({ pageId }: { pageId: string }) {
   return (
     <>
       <div className="flex justify-end mb-3">
-        <SB_LiveIndicator isLive={isLive} lastUpdated={lastUpdated} onToggle={setLive} />
+        <SB_LiveIndicator
+          isLive={isLive}
+          lastUpdated={lastUpdated}
+          onToggle={setLive}
+          realtimeConnected={realtimeConnected}
+        />
       </div>
 
       <SB_Card>
@@ -683,7 +721,7 @@ function PostsTab({ pageId }: { pageId: string }) {
                 View on Facebook ↗
               </a>
             )}
-            <SB_PostDetail post={selected} />
+            <SB_PostDetail key={selected.postId} post={selected} accountId={accountId} />
           </>
         )}
       </SB_Modal>
@@ -698,24 +736,29 @@ interface VideosData {
   videoMetrics: PageVideoMetricsSeries | null;
 }
 
-function VideosTab({ pageId }: { pageId: string }) {
+function VideosTab({ pageId, accountId }: { pageId: string; accountId: string | null }) {
   const { startDate, endDate, label } = useDateRange();
 
-  const { data, loading, error, lastUpdated, isLive, setLive } = useLiveData<VideosData>(
+  const { data, loading, error, lastUpdated, isLive, setLive, realtimeConnected } =
+    useLiveData<VideosData>(
     async () => {
       const [vidRes, metRes] = await Promise.allSettled([
         // The videos endpoint takes no date parameters — only pageId — so the
         // catalogue arrives whole and the window is applied below.
-        fb.getPageVideos(pageId),
-        fb.getPageVideoMetrics(pageId, startDate, endDate),
+        sqlfb.sqlPageVideos(pageId, accountId),
+        sqlfb.sqlPageVideoMetrics(pageId, accountId, startDate, endDate),
       ]);
       return {
         videos: vidRes.status === "fulfilled" ? vidRes.value : [],
         videoMetrics: metRes.status === "fulfilled" ? metRes.value : null,
       };
     },
-    [pageId, startDate, endDate],
-    { interval: 300_000, enabled: false }
+    [pageId, accountId, startDate, endDate],
+    {
+      interval: 300_000,
+      enabled: true,
+      realtime: { pageId, events: ["VideosChanged"] },
+    }
   );
 
   const { videos: allVideos = [], videoMetrics = null } = data ?? {};
@@ -775,7 +818,12 @@ function VideosTab({ pageId }: { pageId: string }) {
   return (
     <>
       <div className="flex justify-end mb-3">
-        <SB_LiveIndicator isLive={isLive} lastUpdated={lastUpdated} onToggle={setLive} />
+        <SB_LiveIndicator
+          isLive={isLive}
+          lastUpdated={lastUpdated}
+          onToggle={setLive}
+          realtimeConnected={realtimeConnected}
+        />
       </div>
       {videoMetrics && (
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-3.5 mb-4">
@@ -849,6 +897,7 @@ export default function FacebookPage() {
     pages,
     selectedPage,
     setPage,
+    selectedAccount,
     needsLogin,
     loginUrl,
     syncPages,
@@ -858,17 +907,21 @@ export default function FacebookPage() {
   } = useFbAccount();
 
   const pageId = selectedPage?.pageId;
+  // The SQL reads scope themselves by account. Null is allowed and resolves to the
+  // single linked account, but with two or more linked an unscoped read is refused
+  // rather than guessing — the same rule the API's middleware applies.
+  const accountId = selectedAccount?.accountId ?? null;
 
   const renderTab = useCallback(() => {
     if (!pageId) return null;
     switch (activeTab) {
-      case "overview":   return <OverviewTab pageId={pageId} />;
-      case "audience":   return <AudienceTab pageId={pageId} />;
-      case "posts":      return <PostsTab pageId={pageId} />;
-      case "videos":     return <VideosTab pageId={pageId} />;
-      default:           return <OverviewTab pageId={pageId} />;
+      case "overview":   return <OverviewTab pageId={pageId} accountId={accountId} />;
+      case "audience":   return <AudienceTab pageId={pageId} accountId={accountId} />;
+      case "posts":      return <PostsTab pageId={pageId} accountId={accountId} />;
+      case "videos":     return <VideosTab pageId={pageId} accountId={accountId} />;
+      default:           return <OverviewTab pageId={pageId} accountId={accountId} />;
     }
-  }, [activeTab, pageId]);
+  }, [activeTab, pageId, accountId]);
 
   return (
     <>

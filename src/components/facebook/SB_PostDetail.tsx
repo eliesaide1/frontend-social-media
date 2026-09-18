@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { RefreshCw, User } from "lucide-react";
 import SB_Card from "@/components/ui/SB_Card";
 import SB_MetricCard from "@/components/ui/SB_MetricCard";
@@ -10,27 +10,10 @@ import SB_DonutChart from "@/components/charts/SB_DonutChart";
 import SB_LineChart from "@/components/charts/SB_LineChart";
 import { formatNumber, formatDuration } from "@/lib/utils";
 import * as fb from "@/services/facebookService";
-import type { TimeSeriesResponse } from "@/types/api";
-import type {
-  StoredPostDto,
-  PostLikesDto,
-  PostReactionsDto,
-  PostEngagementDto,
-  PostCommentDto,
-  PostAttachmentDto,
-  PostVideoMetricsDto,
-  PostMetricPointDto,
-} from "@/types/facebook";
-
-interface PostDetailData {
-  likes: PostLikesDto | null;
-  reactions: PostReactionsDto | null;
-  engagement: PostEngagementDto | null;
-  comments: PostCommentDto[];
-  attachments: PostAttachmentDto[];
-  video: PostVideoMetricsDto | null;
-  history: TimeSeriesResponse<PostMetricPointDto> | null;
-}
+import { sqlPostDetail } from "@/server/facebookActions";
+import { useRealtime } from "@/hooks/useRealtime";
+import type { PostDetail } from "@/server/queries/postDetail";
+import type { StoredPostDto } from "@/types/facebook";
 
 /** Meta's status_type values that mean the post carries a video. */
 const VIDEO_TYPES = new Set(["added_video", "video"]);
@@ -45,112 +28,98 @@ const REACTION_COLORS: Record<string, string> = {
 };
 
 /**
- * Opening one post costs roughly ten Graph calls — post-reactions alone is six,
- * one per reaction type, and is documented as the most rate-limit-expensive
- * endpoint in the API.
+ * Opening a post reads the warehouse — no Graph calls.
  *
- * Nothing here polls. Opening the modal reads live, and the Refresh control
- * re-reads on demand.
+ * The API stores every post read it makes, and nightly ingestion reads each post's
+ * likes, reactions, comments, engagement, attachments and video metrics, so the
+ * figures here are as of the last ingestion or the last webhook.
+ *
+ * Webhook events for this post re-read the warehouse automatically while the modal
+ * is open, so a new comment or reaction appears without touching anything.
+ *
+ * "Refresh from Facebook" is the one deliberate exception: it goes through the API,
+ * which asks Meta and stores the answers, then re-reads the warehouse. The modal
+ * never renders the API's reply directly, so what it shows is always what is stored.
  */
-export default function SB_PostDetail({ post }: { post: StoredPostDto }) {
-  const [data, setData] = useState<PostDetailData | null>(null);
+export default function SB_PostDetail({
+  post,
+  accountId,
+}: {
+  post: StoredPostDto;
+  accountId: string | null;
+}) {
+  const [data, setData] = useState<PostDetail | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
   const [refreshing, setRefreshing] = useState(false);
   const [reloadKey, setReloadKey] = useState(0);
-  const refresh = () => setReloadKey((k) => k + 1);
 
-  /**
-   * Opening a post always reads live.
-   *
-   * The API caches post counts in SQL with no time expiry — only a Facebook
-   * webhook refreshes them — so a like made moments ago reads as 0 until that
-   * event lands. This component used to hold its own per-post map on top of
-   * that, which meant reopening a post could not correct the number either.
-   *
-   * Both caches are now bypassed: opening the modal is a deliberate action,
-   * and showing a stale count at that moment is worse than the Graph calls it
-   * costs. The trade is that reopening the same post pays for the reads again.
-   */
   useEffect(() => {
+    // Loading starts true and the page keys this component by post id, so a new
+    // post always mounts fresh; a reload keeps the current figures on screen.
     let cancelled = false;
-    const postId = post.postId;
-    const isReload = reloadKey > 0;
 
-    (async () => {
-      if (isReload) setRefreshing(true);
-      else setLoading(true);
-      setError(null);
-
-      // Non-video posts return zeros from post-video-metrics, so skip the call
-      // rather than spend a Graph request confirming a row of noughts.
-      const isVideo = VIDEO_TYPES.has(post.type ?? "");
-
-      // refresh=true is only accepted by the read-through cached endpoints.
-      // post-engagement, post-attachments and post-video-metrics are always
-      // live, so they need no flag.
-      const [
-        likesRes,
-        reactionsRes,
-        engagementRes,
-        commentsRes,
-        attachmentsRes,
-        historyRes,
-        videoRes,
-      ] = await Promise.allSettled([
-        fb.getPostLikes(postId, true),
-        fb.getPostReactions(postId, true),
-        fb.getPostEngagement(postId),
-        fb.getPostComments(postId, true),
-        fb.getPostAttachments(postId),
-        fb.getPostMetricsHistory(postId),
-        isVideo ? fb.getPostVideoMetrics(postId) : Promise.resolve(null),
-      ]);
-
-      if (cancelled) return;
-
-      const next: PostDetailData = {
-        likes: likesRes.status === "fulfilled" ? likesRes.value : null,
-        reactions: reactionsRes.status === "fulfilled" ? reactionsRes.value : null,
-        engagement:
-          engagementRes.status === "fulfilled" ? engagementRes.value : null,
-        comments: commentsRes.status === "fulfilled" ? commentsRes.value ?? [] : [],
-        attachments:
-          attachmentsRes.status === "fulfilled" ? attachmentsRes.value ?? [] : [],
-        video: videoRes.status === "fulfilled" ? videoRes.value : null,
-        history: historyRes.status === "fulfilled" ? historyRes.value : null,
-      };
-
-      // Every call failing is a real error; a partial result is normal here,
-      // since several of these depend on permissions the token may not carry.
-      const allFailed = [
-        likesRes,
-        reactionsRes,
-        engagementRes,
-        commentsRes,
-        attachmentsRes,
-        historyRes,
-      ].every((r) => r.status === "rejected");
-
-      if (allFailed) {
-        const reason = likesRes.status === "rejected" ? likesRes.reason : null;
-        setError(
-          reason instanceof Error
-            ? reason.message
-            : "Could not load metrics for this post."
-        );
-      }
-
-      setData(next);
-      setLoading(false);
-      setRefreshing(false);
-    })();
+    sqlPostDetail(post.pageId, post.postId, accountId)
+      .then((d) => {
+        if (cancelled) return;
+        setData(d);
+        setError(null);
+      })
+      .catch((err) => {
+        if (!cancelled)
+          setError(err instanceof Error ? err.message : "Could not load metrics for this post.");
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
 
     return () => {
       cancelled = true;
     };
-  }, [post.postId, post.type, reloadKey]);
+  }, [post.pageId, post.postId, accountId, reloadKey]);
+
+  /**
+   * Live updates: when a webhook event lands for THIS post, re-read SQL.
+   *
+   * The API stores the change before it emits the event, so the re-read sees it.
+   * Events for other posts on the page are ignored. Reactions tend to arrive in
+   * bursts, so re-reads are debounced rather than fired once per event.
+   */
+  const debounce = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => {
+    if (debounce.current) clearTimeout(debounce.current);
+  }, []);
+
+  useRealtime({
+    pageId: post.pageId,
+    events: ["EngagementChanged", "CommentChanged", "PostChanged"],
+    onEvent: (event) => {
+      if (!("postId" in event) || event.postId !== post.postId) return;
+      if (debounce.current) clearTimeout(debounce.current);
+      debounce.current = setTimeout(() => setReloadKey((k) => k + 1), 600);
+    },
+  });
+
+  /**
+   * Asks Meta through the API — roughly ten Graph calls, six of them for reactions
+   * alone — then re-reads SQL. allSettled because several reads depend on
+   * permissions the token may not carry; whatever succeeded has been stored.
+   */
+  const refreshFromFacebook = async () => {
+    setRefreshing(true);
+    const postId = post.postId;
+    await Promise.allSettled([
+      fb.getPostLikes(postId, true),
+      fb.getPostReactions(postId, true),
+      fb.getPostEngagement(postId),
+      fb.getPostComments(postId, true),
+      fb.getPostAttachments(postId),
+      VIDEO_TYPES.has(post.type ?? "") ? fb.getPostVideoMetrics(postId) : Promise.resolve(null),
+    ]);
+    setRefreshing(false);
+    setReloadKey((k) => k + 1);
+  };
 
   if (loading) {
     return (
@@ -163,8 +132,8 @@ export default function SB_PostDetail({ post }: { post: StoredPostDto }) {
     return <div className="text-center py-16 text-red text-sm">{error}</div>;
   }
 
-  const { likes, reactions, engagement, comments, attachments, video, history } =
-    data ?? ({} as PostDetailData);
+  const { likes, reactions, engagement, comments = [], attachments = [], video, history, metricsDate } =
+    data ?? ({} as Partial<PostDetail>);
 
   const reactionsDonut = reactions
     ? [
@@ -193,22 +162,20 @@ export default function SB_PostDetail({ post }: { post: StoredPostDto }) {
 
   return (
     <div className="grid gap-4">
-      {/* Likes, reactions and comments are served from the API's stored copy
-          and refreshed by a Facebook webhook, not on a timer — so a like made
-          seconds ago can still read as 0 until that event lands. This forces a
-          live read past both the API's cache and this component's. */}
+      {/* Stored figures, current as of the last ingestion or webhook. Refresh asks
+          Meta through the API, which stores the answer, then re-reads SQL. */}
       <div className="flex items-center justify-end gap-3 -mb-1">
         <span className="text-[11px] text-muted">
-          Counts read live each time this opens
+          {metricsDate ? `Stored data as of ${metricsDate}` : "No stored metrics for this post yet"}
         </span>
         <button
           type="button"
-          onClick={refresh}
+          onClick={refreshFromFacebook}
           disabled={refreshing}
           className="inline-flex items-center gap-1.5 text-xs text-brand hover:underline disabled:opacity-50 disabled:no-underline"
         >
           <RefreshCw size={13} className={refreshing ? "animate-spin" : ""} />
-          {refreshing ? "Refreshing…" : "Refresh now"}
+          {refreshing ? "Refreshing…" : "Refresh from Facebook"}
         </button>
       </div>
 
@@ -298,7 +265,7 @@ export default function SB_PostDetail({ post }: { post: StoredPostDto }) {
         </SB_Card>
       </div>
 
-      {/* Video performance — only fetched for video posts */}
+      {/* Video performance — only stored for video posts */}
       {video && (
         <SB_Card>
           <strong className="text-sm">Video Performance</strong>
@@ -357,7 +324,7 @@ export default function SB_PostDetail({ post }: { post: StoredPostDto }) {
         </SB_Card>
       )}
 
-      {/* Attachments — the only post data never persisted to SQL Server */}
+      {/* Attachments */}
       {attachments.length > 0 && (
         <SB_Card>
           <strong className="text-sm">Attachments ({attachments.length})</strong>

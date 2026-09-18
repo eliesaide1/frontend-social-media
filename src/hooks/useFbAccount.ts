@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useCallback } from "react";
 import * as fb from "@/services/facebookService";
+import { sqlBusinessesWithPages } from "@/server/facebookActions";
 import type {
   AuthStatus,
   BusinessWithPagesDto,
@@ -69,23 +70,20 @@ export function useFbAccount(): UseFbAccountReturn {
   /**
    * Page discovery, in order of fidelity.
    *
-   * There is no "list this account's pages" endpoint. businesses-with-pages is
-   * the closest, but its query starts FROM meta.businesses — a Page reached
-   * directly by a system user, with no Business Manager above it, has no
-   * business row to join to and so comes back as an empty array even though
-   * meta.pages holds it and the account reports pageCount > 0.
-   *
-   * The ingestion checkpoints carry pageId and pageName for every page the
-   * pipeline actually runs against, so they cover exactly that case. Both
-   * reads hit SQL Server rather than Meta, so page discovery keeps working
-   * with an expired token — which is when the stored history matters most.
+   * The page list is read straight from SQL (meta.pages, grouped by business),
+   * including pages with no Business Manager above them. The ingestion
+   * checkpoints remain as a fallback for an empty registry. Neither read
+   * touches Meta, so page discovery keeps working with an expired token —
+   * which is when the stored history matters most.
    */
   const loadPages = useCallback(
     async (accountId: string) => {
       fb.setActiveAccount(accountId);
 
       const [businessRes, statusRes] = await Promise.allSettled([
-        fb.getBusinessesWithPages(),
+        // Straight from SQL: the pages page-sync stored. Discovery itself (syncPages)
+        // still goes through the API, because it has to ask Meta.
+        sqlBusinessesWithPages(accountId),
         fb.getIngestionStatus(),
       ]);
 

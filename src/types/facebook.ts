@@ -491,14 +491,19 @@ export interface PostMetricPointDto {
 
 export interface PageMetricPointDto {
   date: string;
+  /**
+   * Null means "not measured that day" — never zero. Follower counts are
+   * point-in-time values Meta only reports as of now, so backfilled days have
+   * none; activity figures are absent on rows written by the followers call.
+   */
   /** Legacy Page likes; usually mirrors followersCount — see PageFollowersDto */
-  fanCount: number;
-  followersCount: number;
-  /** page_impressions_unique — 0, since the metric was deprecated */
-  reach: number;
+  fanCount: number | null;
+  followersCount: number | null;
+  /** page_impressions_unique — 0 when reported, since the metric was deprecated */
+  reach: number | null;
   /** page_views_total, renamed for BI clarity */
-  interest: number;
-  postEngagements: number;
+  interest: number | null;
+  postEngagements: number | null;
   /** Derived on read; null on the first point of a series */
   followersDelta: number | null;
 }
@@ -554,27 +559,6 @@ export interface IngestionStatusDto {
   checkpoints: IngestionCheckpoint[];
 }
 
-/** GET /api/operations/cache-status — what the next read of each resource does. */
-export interface CacheStatusDto {
-  pageId: string;
-  cacheEnabled: boolean;
-  webhookRefreshMode: string;
-  resources: CacheResourceStatus[];
-}
-
-export interface CacheResourceStatus {
-  kind: string;
-  key: string | null;
-  isFetched: boolean;
-  isStale: boolean;
-  lastFetchedAt: string | null;
-  staleSince: string | null;
-  staleReason: string | null;
-  ttlMinutes: number | null;
-  expiresAt: string | null;
-  /** True when the next read will call Meta rather than serve stored data */
-  nextReadCallsMeta: boolean;
-}
 
 // ─── Ranged metric responses ─────────────────────────────────
 
